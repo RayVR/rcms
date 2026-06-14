@@ -1,5 +1,5 @@
-//! Errors are values. Allocation-free: `&'static str` / `u32` only, so the core
-//! stays no_std/alloc-free and the (not-cold) malformed-profile path never heaps.
+//! Errors are values. The `Error` type is allocation-free — `&'static str` /
+//! `u32` only — so the (not-cold) malformed-profile path never heap-allocates.
 //! Rich context (offending value, byte offset) is emitted via the Context logger.
 
 use crate::sig::Signature;

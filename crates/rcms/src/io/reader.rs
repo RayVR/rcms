@@ -1,6 +1,8 @@
-//! Positioned, big-endian profile reader. Our own trait (not std::io) so the core
-//! stays no_std-portable; ICC is big-endian on the wire. `read_at` (positioned)
-//! is a deliberate improvement over lcms2's seek-then-read-only IOHANDLER. seek/tell
+//! Positioned, big-endian profile reader. Our own trait (not `std::io`) keeps the
+//! core's I/O abstract and OS-free — the parse path never touches the filesystem,
+//! so the crate compiles cleanly to wasm32 and file access stays behind the
+//! `file-io` feature. ICC is big-endian on the wire. `read_at` (positioned) is a
+//! deliberate improvement over lcms2's seek-then-read-only IOHANDLER. seek/tell
 //! are u64 (lcms2 uses u32) — intentional widening; do not narrow back.
 
 use crate::color::CIEXYZ;
