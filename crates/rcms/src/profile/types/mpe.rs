@@ -65,7 +65,11 @@ fn read_position_table<R: ProfileReader>(
 ) -> Result<()> {
     // Read every (offset, size) pair first, then process — the C buffers the
     // whole table before seeking (the reads here advance past the directory).
-    let mut offsets = Vec::with_capacity(count as usize);
+    // Cap the capacity hint: `count` is an attacker-controlled u32 ElementCount;
+    // an unbounded hint reserves gigabytes and aborts before the first read. The
+    // loop is bounded by `count` reads that fail on truncation. (Same pattern as
+    // the MLU/named readers.)
+    let mut offsets = Vec::with_capacity((count as usize).min(0x1_0000));
     for _ in 0..count {
         let off = r.read_u32()? as u64;
         let _size = r.read_u32()?;
@@ -143,12 +147,16 @@ fn read_segmented_curve<R: ProfileReader>(r: &mut R) -> Result<ToneCurve> {
             }
             SIG_SAMPLED_CURVE_SEG => {
                 let count = r.read_u32()?;
-                // The first point is implicit; allocate an extra slot (set to 0
-                // here, filled by build_mpe_segmented's fix-up).
+                // The first point is implicit (slot 0 = 0.0, filled by
+                // build_mpe_segmented's fix-up). Build incrementally rather than
+                // pre-allocating `count+1` from the untrusted u32 (which would
+                // abort on a malformed huge count); the reads fail fast on
+                // truncation.
                 let total = count as usize + 1;
-                let mut sampled = vec![0.0f32; total];
-                for slot in sampled.iter_mut().skip(1) {
-                    *slot = r.read_f32()?;
+                let mut sampled = Vec::with_capacity(total.min(0x1_0000));
+                sampled.push(0.0f32);
+                for _ in 0..count {
+                    sampled.push(r.read_f32()?);
                 }
                 seg.seg_type = 0;
                 seg.sampled = sampled;
