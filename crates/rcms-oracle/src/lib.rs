@@ -14,6 +14,8 @@ unsafe extern "C" {
     fn rcms_oracle_mat3_per(out: *mut f64, a: *const f64, b: *const f64);
     fn rcms_oracle_mat3_inverse(out: *mut f64, a: *const f64) -> i32;
     fn rcms_oracle_mat3_solve(out: *mut f64, a: *const f64, b: *const f64) -> i32;
+    fn rcms_oracle_half_to_float(h: u16) -> f32;
+    fn rcms_oracle_float_to_half(f: f32) -> u16;
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
@@ -93,6 +95,17 @@ pub fn mat3_solve(a: &[f64; 9], b: &[f64; 3]) -> Option<[f64; 3]> {
     } else {
         None
     }
+}
+
+/// lcms2 `_cmsHalf2Float`.
+pub fn half_to_float(h: u16) -> f32 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_half_to_float(h) }
+}
+/// lcms2 `_cmsFloat2Half`.
+pub fn float_to_half(f: f32) -> u16 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_float_to_half(f) }
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.

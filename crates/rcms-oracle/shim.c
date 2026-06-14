@@ -38,3 +38,7 @@ int rcms_oracle_mat3_solve(double out[3], const double a[9], const double b[3]) 
     cmsMAT3 A; cmsVEC3 B,X; load_mat(&A,a); B.n[0]=b[0]; B.n[1]=b[1]; B.n[2]=b[2];
     if (!_cmsMAT3solve(&X,&A,&B)) return 0; out[0]=X.n[0]; out[1]=X.n[1]; out[2]=X.n[2]; return 1;
 }
+
+/* IEEE half<->float (cmshalf.c, table-based van der Zijp method). */
+float    rcms_oracle_half_to_float(uint16_t h) { return _cmsHalf2Float(h); }
+uint16_t rcms_oracle_float_to_half(float f)    { return _cmsFloat2Half(f); }
