@@ -855,3 +855,19 @@ int rcms_oracle_dict_entry(const uint8_t* buf, uint32_t len, uint32_t sig, uint3
     cmsCloseProfile(p);
     return ok;
 }
+
+/* cmsReadTag of a curv/para tag -> a cmsToneCurve*, sampled via
+   cmsEvalToneCurveFloat at the n caller-supplied x points (xs[0..n]), written to
+   ys[0..n]. Returns 1 on success, 0 if the profile cannot be opened or the tag
+   is absent / not tone-curve-backed. cmsReadTag returns a pointer lcms2 owns
+   (freed with the profile), so we do NOT free it here. */
+int rcms_oracle_read_tag_curve(const uint8_t* buf, uint32_t len, uint32_t sig,
+                               const float* xs, uint32_t n, float* ys) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsToneCurve* c = (cmsToneCurve*) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!c) { cmsCloseProfile(p); return 0; }
+    for (uint32_t i = 0; i < n; i++) ys[i] = cmsEvalToneCurveFloat(c, xs[i]);
+    cmsCloseProfile(p);
+    return 1;
+}

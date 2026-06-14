@@ -156,6 +156,14 @@ unsafe extern "C" {
         cap: u32,
         used: *mut u32,
     ) -> i32;
+    fn rcms_oracle_read_tag_curve(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        xs: *const f32,
+        n: u32,
+        ys: *mut f32,
+    ) -> i32;
     fn rcms_oracle_dict_count(buf: *const u8, len: u32, sig: u32) -> i32;
     fn rcms_oracle_dict_entry(
         buf: *const u8,
@@ -1275,6 +1283,34 @@ pub fn read_tag_dict(buf: &[u8], sig: u32) -> Option<OracleDict> {
         });
     }
     Some(OracleDict { entries })
+}
+
+/// lcms2 `cmsReadTag` of a `curv`/`para` tag -> a `cmsToneCurve*`, sampled via
+/// `cmsEvalToneCurveFloat` at each `x` in `xs`. Returns the per-point samples (one
+/// per `x`), or `None` if lcms2 cannot open the profile or the tag is absent / not
+/// tone-curve-backed. This is the bit-exact reference for an rcms `Tag::Curve`'s
+/// `eval_float` at the same points.
+pub fn read_tag_curve(buf: &[u8], sig: u32, xs: &[f32]) -> Option<Vec<f32>> {
+    let mut ys = vec![0.0f32; xs.len()];
+    // SAFETY: buf/len describe a valid readable slice C only reads; xs is a valid
+    // readable slice of `xs.len()` f32, and ys has exactly that many f32 of room,
+    // which is what C writes when it returns nonzero. The cmsToneCurve* C samples
+    // is owned by the profile (freed on cmsCloseProfile inside the call).
+    let ok = unsafe {
+        rcms_oracle_read_tag_curve(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            xs.as_ptr(),
+            xs.len() as u32,
+            ys.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(ys)
+    } else {
+        None
+    }
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.

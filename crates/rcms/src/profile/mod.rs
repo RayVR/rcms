@@ -190,7 +190,8 @@ fn elem_count(tag: &Tag) -> u32 {
         | Tag::NamedColor2(_)
         | Tag::ProfileSequenceDesc(_)
         | Tag::ProfileSequenceId(_)
-        | Tag::Dict(_) => 1,
+        | Tag::Dict(_)
+        | Tag::Curve(_) => 1,
     }
 }
 
@@ -733,12 +734,11 @@ mod tests {
         }
     }
 
-    /// A deferred-type tag (a TRC curve, on-disk type `'curv'`/`'para'`) must
-    /// return `Error::Unsupported` from `read_tag` — never a panic or a wrong
-    /// value. lcms2 *can* read it; rcms defers curve types to a later slice, so
-    /// rcms returning Unsupported is the contracted behaviour for now.
+    /// A TRC curve tag (on-disk type `'curv'`/`'para'`) now decodes to a
+    /// `Tag::Curve` — it must NO LONGER return `Error::Unsupported` (this slice
+    /// implemented the curve readers that the slice-2 dispatcher deferred).
     #[test]
-    fn deferred_type_tag_returns_unsupported() {
+    fn trc_curve_tag_no_longer_unsupported() {
         let red_trc = Signature::from_raw(0x7254_5243); // 'rTRC'
         let gray_trc = Signature::from_raw(0x6b54_5243); // 'kTRC'
 
@@ -756,7 +756,7 @@ mod tests {
                 if !p.has_tag(sig) {
                     continue;
                 }
-                // Only assert for curve/parametric on-disk types (the deferred set).
+                // Only assert for curve/parametric on-disk types.
                 let ty = match rcms_oracle::tag_true_type(&bytes, sig.to_raw()) {
                     Some(t) => t,
                     None => continue,
@@ -766,10 +766,15 @@ mod tests {
                 if ty != TY_CURV && ty != TY_PARA {
                     continue;
                 }
-                assert_eq!(
-                    p.read_tag(sig),
-                    Err(Error::Unsupported("tag type deferred to a later slice")),
-                    "deferred curve tag {sig} in {:?} should be Unsupported",
+                let res = p.read_tag(sig);
+                assert!(
+                    !matches!(res, Err(Error::Unsupported(_))),
+                    "curve tag {sig} in {:?} should no longer be Unsupported, got {res:?}",
+                    path.file_name().unwrap()
+                );
+                assert!(
+                    matches!(res, Ok(Tag::Curve(_))),
+                    "curve tag {sig} in {:?} should decode to Tag::Curve, got {res:?}",
                     path.file_name().unwrap()
                 );
                 checked += 1;
@@ -777,7 +782,7 @@ mod tests {
         }
         assert!(
             checked > 0,
-            "expected at least one deferred TRC curve tag in the testbed"
+            "expected at least one TRC curve tag in the testbed"
         );
     }
 
@@ -897,6 +902,8 @@ mod tests {
         0x7073_6571, // 'pseq' ProfileSequenceDesc
         0x7073_6964, // 'psid' ProfileSequenceId
         0x6469_6374, // 'dict' Dictionary
+        0x6375_7276, // 'curv' Curve
+        0x7061_7261, // 'para' ParametricCurve
     ];
 
     /// Comprehensive testbed sweep: for every `vendor/Little-CMS/testbed/*.icc`:
@@ -1097,6 +1104,128 @@ mod tests {
                 "type {ty:08x} should dispatch, got {res:?}"
             );
             assert!(res.is_ok(), "type {ty:08x} should parse, got {res:?}");
+        }
+    }
+
+    /// Differential: for every testbed profile both rcms and lcms2 accept, every
+    /// tag whose on-disk TYPE is `curv` or `para` must decode to a `Tag::Curve`
+    /// whose `eval_float` is bit-identical (f32::to_bits) to lcms2's
+    /// `cmsEvalToneCurveFloat` at 256 sample points in [0, 1]. Tallies how many
+    /// curve tags were exercised over how many profiles.
+    #[test]
+    fn curve_tag_values_match_oracle_over_testbed() {
+        const TY_CURV: u32 = 0x6375_7276; // 'curv'
+        const TY_PARA: u32 = 0x7061_7261; // 'para'
+
+        // 256 sample points x in [0, 1] (inclusive endpoints).
+        let xs: Vec<f32> = (0..256).map(|i| i as f32 / 255.0).collect();
+
+        let files = testbed_icc();
+        assert!(!files.is_empty(), "no .icc in testbed");
+
+        let mut curv_tags = 0usize;
+        let mut para_tags = 0usize;
+        let mut profiles_with_curve = 0usize;
+
+        for path in &files {
+            let bytes = fs::read(path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+
+            if !rcms_oracle::open_succeeds(&bytes) {
+                continue;
+            }
+            let p = match Profile::open(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let mut hit_here = false;
+            for sig in p.tags().collect::<Vec<_>>() {
+                let raw = sig.to_raw();
+                let ty = match rcms_oracle::tag_true_type(&bytes, raw) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if ty != TY_CURV && ty != TY_PARA {
+                    continue;
+                }
+
+                // Must no longer be Unsupported, and must be a Tag::Curve.
+                let curve = match p.read_tag(sig).expect("rust curve") {
+                    Tag::Curve(c) => c,
+                    other => panic!("{name}:{raw:08x} expected Curve, got {other:?}"),
+                };
+
+                let c = rcms_oracle::read_tag_curve(&bytes, raw, &xs).expect("oracle curve");
+                assert_eq!(c.len(), xs.len(), "{name}:{raw:08x} sample count");
+                for (i, (&x, &cy)) in xs.iter().zip(c.iter()).enumerate() {
+                    let ry = curve.eval_float(x);
+                    assert_eq!(
+                        ry.to_bits(),
+                        cy.to_bits(),
+                        "{name}:{raw:08x} curve sample[{i}] x={x}: rust={ry} lcms2={cy}"
+                    );
+                }
+
+                match ty {
+                    TY_CURV => curv_tags += 1,
+                    TY_PARA => para_tags += 1,
+                    _ => unreachable!(),
+                }
+                hit_here = true;
+            }
+            if hit_here {
+                profiles_with_curve += 1;
+            }
+        }
+
+        println!(
+            "testbed curve diff: {curv_tags} curv + {para_tags} para tags over \
+             {profiles_with_curve} profiles"
+        );
+        assert!(
+            curv_tags + para_tags > 0,
+            "expected at least one curv/para tag in the testbed"
+        );
+    }
+
+    /// `curv`/`para` tags no longer return `Error::Unsupported` from the type
+    /// dispatcher (the slice-2 fallthrough is gone for these two type sigs).
+    #[test]
+    fn curve_types_now_dispatch() {
+        use crate::io::MemReader;
+        use crate::profile::types::read_tag_value;
+
+        // curv: Count = 0 (linear).
+        let curv = 0u32.to_be_bytes().to_vec();
+        // para: ICC Type 0, reserved, one s15Fixed16 gamma = 1.0.
+        let para = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0u16.to_be_bytes()); // Type 0
+            b.extend_from_slice(&0u16.to_be_bytes()); // reserved
+            b.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // 1.0
+            b
+        };
+
+        for (ty, body) in [
+            (0x6375_7276u32, curv), // 'curv'
+            (0x7061_7261, para),    // 'para'
+        ] {
+            let mut full = Vec::new();
+            full.extend_from_slice(&ty.to_be_bytes());
+            full.extend_from_slice(&[0, 0, 0, 0]); // reserved
+            full.extend_from_slice(&body);
+            let mut r = MemReader::new(&full);
+            let _ = r.read_type_base().unwrap();
+            let res = read_tag_value(Signature::from_raw(ty), &mut r, body.len() as u32);
+            assert!(
+                !matches!(res, Err(Error::Unsupported(_))),
+                "type {ty:08x} should dispatch, got {res:?}"
+            );
+            assert!(
+                matches!(res, Ok(Tag::Curve(_))),
+                "type {ty:08x} should parse to Curve, got {res:?}"
+            );
         }
     }
 }

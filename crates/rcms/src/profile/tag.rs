@@ -7,6 +7,7 @@
 //! variants here: dispatching to them yields `Error::Unsupported` for now.
 
 use crate::color::{CIExyYTriple, CIEXYZ};
+use crate::curve::ToneCurve;
 use crate::fixed::{S15Fixed16, U16Fixed16};
 use crate::profile::header::DateTime;
 use crate::sig::Signature;
@@ -84,6 +85,11 @@ pub enum Tag {
     /// metadata dictionary — name/value UTF-16 strings with optional localized
     /// display-name/value MLUs. Carried by the `meta` (and `dict`) tags.
     Dict(Dict),
+    /// `cmsSigCurveType` (`'curv'`, `Type_Curve_Read`, `cmstypes.c:1333`) AND
+    /// `cmsSigParametricCurveType` (`'para'`, `Type_ParametricCurve_Read`,
+    /// `cmstypes.c:1451`). Both decode in lcms2 to a `cmsToneCurve`, so they share
+    /// one Rust value. Carried by the per-channel TRC tags (red/green/blue/grayTRC).
+    Curve(ToneCurve),
 }
 
 /// One named colour of a `cmsNAMEDCOLORLIST` (`cmstypes.c:3369`). `name` is the
