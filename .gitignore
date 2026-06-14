@@ -1,0 +1,14 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Planning & design artifacts — kept on disk only, NEVER committed
+/docs/superpowers/
+
+# Vendored oracle source is a submodule, not tracked content here
+# (added via `git submodule add` when the harness lands)
+
+# Editor / OS
+.DS_Store
+*.swp
