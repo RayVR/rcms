@@ -11,7 +11,8 @@
 //!   identity round-trip via an empty / identity pipeline.
 
 use rcms::curve::{build_tabulated_16, ToneCurve};
-use rcms::pipeline::{Pipeline, Stage};
+use rcms::interp::InterpParams;
+use rcms::pipeline::{Clut, ClutTable, Pipeline, Stage};
 use rcms_oracle::Rng;
 
 /// A random f64 in [-2, 2) — matrix entries span sign and a useful magnitude.
@@ -352,4 +353,191 @@ fn insert_stage_validates_chaining() {
     // A 2-channel identity does chain.
     pl.insert_stage_at_end(Stage::Identity(2)).unwrap();
     assert_eq!(pl.stages().len(), 2);
+}
+
+/// Total node count of a CLUT grid (product of per-axis sample counts).
+fn cube_size(grid: &[u32]) -> usize {
+    grid.iter().map(|&n| n as usize).product()
+}
+
+/// Build a `Clut` stage wrapped in a 1-stage pipeline, diff its float-domain
+/// eval against the matching lcms2 CLUT-stage pipeline (via `cmsPipelineEvalFloat`).
+#[test]
+fn clut_stage_u16_3d_and_4d() {
+    let mut rng = Rng::new(0xC10D_3D4D);
+
+    // 3D (tetrahedral) and 4D (EvalN) grids, varied per-axis sample counts.
+    let cases: &[(&[u32], usize)] = &[
+        (&[2, 2, 2], 3),
+        (&[3, 4, 5], 3),
+        (&[9, 9, 9], 4),
+        (&[2, 3, 4, 5], 3),
+        (&[3, 3, 3, 3], 4),
+    ];
+
+    for &(grid, n_out) in cases {
+        let n_in = grid.len();
+        let table_len = cube_size(grid) * n_out;
+
+        for trial in 0..200 {
+            let table: Vec<u16> = (0..table_len).map(|_| rng.next_u64() as u16).collect();
+
+            let clut = Clut {
+                table: ClutTable::U16(table.clone()),
+                params: InterpParams::new(grid, n_in, n_out),
+            };
+            let mut pl = Pipeline::new(n_in, n_out);
+            pl.insert_stage_at_end(Stage::Clut(clut)).unwrap();
+
+            let input: Vec<f32> = (0..n_in).map(|_| rand_in_f32(&mut rng)).collect();
+
+            let got = pl.eval_float(&input);
+            let exp = rcms_oracle::clut_stage_eval16(grid, n_out, &table, &input)
+                .expect("oracle clut16 stage");
+            for i in 0..n_out {
+                assert_f32_bits(
+                    got[i],
+                    exp[i],
+                    &format!("clut u16 grid={grid:?} nOut={n_out} trial={trial} out={i}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn clut_stage_f32_3d() {
+    let mut rng = Rng::new(0xC10F3D);
+
+    let cases: &[(&[u32], usize)] = &[(&[2, 2, 2], 3), (&[4, 5, 6], 3), (&[9, 9, 9], 4)];
+
+    for &(grid, n_out) in cases {
+        let n_in = grid.len();
+        let table_len = cube_size(grid) * n_out;
+
+        for trial in 0..200 {
+            // Float CLUT values in [0,1) (lcms2's float CLUT domain).
+            let table: Vec<f32> = (0..table_len).map(|_| rng.next_f64_unit() as f32).collect();
+
+            let clut = Clut {
+                table: ClutTable::F32(table.clone()),
+                params: InterpParams::new(grid, n_in, n_out),
+            };
+            let mut pl = Pipeline::new(n_in, n_out);
+            pl.insert_stage_at_end(Stage::Clut(clut)).unwrap();
+
+            let input: Vec<f32> = (0..n_in).map(|_| rand_in_f32(&mut rng)).collect();
+
+            let got = pl.eval_float(&input);
+            let exp = rcms_oracle::clut_stage_eval_float(grid, n_out, &table, &input)
+                .expect("oracle clut float stage");
+            for i in 0..n_out {
+                assert_f32_bits(
+                    got[i],
+                    exp[i],
+                    &format!("clut f32 grid={grid:?} nOut={n_out} trial={trial} out={i}"),
+                );
+            }
+        }
+    }
+}
+
+/// Diff each Lab/XYZ conversion stage against the matching lcms2 stage eval over
+/// random inputs in the valid normalized (0..1.0) domain.
+#[test]
+fn lab_xyz_stages_match_oracle() {
+    let mut rng = Rng::new(0x1AB0072);
+
+    // (which, Stage). which: 0=Lab2XYZ, 1=XYZ2Lab, 2=LabV2ToV4, 3=LabV4ToV2.
+    let cases = [
+        (0u32, Stage::Lab2Xyz),
+        (1u32, Stage::Xyz2Lab),
+        (2u32, Stage::LabV2ToV4),
+        (3u32, Stage::LabV4ToV2),
+    ];
+
+    for (which, stage) in cases {
+        let mut pl = Pipeline::new(3, 3);
+        pl.insert_stage_at_end(stage).unwrap();
+
+        for trial in 0..200_000 {
+            let input = [
+                rand_in_f32(&mut rng),
+                rand_in_f32(&mut rng),
+                rand_in_f32(&mut rng),
+            ];
+            let got = pl.eval_float(&input);
+            let exp = rcms_oracle::labxyz_stage_eval(which, &input).expect("oracle labxyz stage");
+            for i in 0..3 {
+                assert_f32_bits(
+                    got[i],
+                    exp[i],
+                    &format!("labxyz which={which} trial={trial} in={input:?} out={i}"),
+                );
+            }
+        }
+    }
+}
+
+/// A pipeline combining a CLUT stage + curves + matrix, diffed vs
+/// `cmsPipelineEvalFloat`.
+#[test]
+fn pipeline_clut_curves_matrix_float() {
+    let mut rng = Rng::new(0xC1C23A);
+
+    let grid: &[u32] = &[5, 6, 7];
+    let n_in = 3usize;
+    let n_out = 4usize; // CLUT outputs == curve count == matrix cols
+    let tbl_len = 33usize;
+    let rows = 3usize;
+
+    for trial in 0..500 {
+        let table_len = cube_size(grid) * n_out;
+        let clut_table: Vec<u16> = (0..table_len).map(|_| rng.next_u64() as u16).collect();
+        let (curves, curve_tables) = build_random_curves(&mut rng, n_out, tbl_len);
+        let m: Vec<f64> = (0..rows * n_out).map(|_| rand_m(&mut rng)).collect();
+        let offset: Option<Vec<f64>> = if trial % 3 == 0 {
+            None
+        } else {
+            Some((0..rows).map(|_| rand_off(&mut rng)).collect())
+        };
+
+        let mut pl = Pipeline::new(n_in, rows);
+        pl.insert_stage_at_end(Stage::Clut(Clut {
+            table: ClutTable::U16(clut_table.clone()),
+            params: InterpParams::new(grid, n_in, n_out),
+        }))
+        .unwrap();
+        pl.insert_stage_at_end(Stage::ToneCurves(curves)).unwrap();
+        pl.insert_stage_at_end(Stage::Matrix {
+            rows,
+            cols: n_out,
+            m: m.clone(),
+            offset: offset.clone(),
+        })
+        .unwrap();
+
+        let input: Vec<f32> = (0..n_in).map(|_| rand_in_f32(&mut rng)).collect();
+
+        let got = pl.eval_float(&input);
+        let exp = rcms_oracle::pipeline_clut_curves_matrix_eval_float(
+            grid,
+            n_out,
+            &clut_table,
+            tbl_len,
+            &curve_tables,
+            rows,
+            &m,
+            offset.as_deref(),
+            &input,
+        )
+        .expect("oracle clut+curves+matrix");
+        for i in 0..rows {
+            assert_f32_bits(
+                got[i],
+                exp[i],
+                &format!("clut+curves+matrix trial={trial} out={i}"),
+            );
+        }
+    }
 }

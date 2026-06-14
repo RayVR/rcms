@@ -5,8 +5,10 @@
 //! (cmslut.c:1329-1374). The 16-bit entry point converts in/out at the boundary
 //! with `From16ToFloat` / `FromFloatTo16` (cmslut.c:83-101).
 
+mod clut;
 mod stage;
 
+pub use clut::{Clut, ClutTable};
 pub use stage::Stage;
 
 use crate::compat::floor::{FloorStrategy, Lcms2Floor};

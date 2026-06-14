@@ -1137,3 +1137,99 @@ int rcms_oracle_pipeline_curves_matrix_eval_float(uint32_t nCurves, uint32_t tbl
     cmsPipelineFree(lut);
     return 1;
 }
+
+/* ---- CLUT stage float-domain eval (slice 4 task 3) -------------------------
+   Build a single CLUT stage (16-bit or float, n-D granular) wrapped in a
+   1-stage nIn->nOut pipeline, and evaluate one input vector via
+   cmsPipelineEvalFloat. A 16-bit CLUT therefore exercises EvaluateCLUTfloatIn16
+   (FromFloatTo16 -> Lerp16 -> From16ToFloat); a float CLUT exercises
+   EvaluateCLUTfloat (direct LerpFloat). `grid` is the per-axis sample count
+   (nIn entries); `table` is row-major with nOut values per node. */
+int rcms_oracle_clut_stage_eval16(const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+                                  const uint16_t* table,
+                                  const float* in, float* out) {
+    cmsStage* stage = cmsStageAllocCLut16bitGranular(NULL, grid, nIn, nOut, table);
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nIn, nOut);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_clut_stage_eval_float(const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+                                      const float* table,
+                                      const float* in, float* out) {
+    cmsStage* stage = cmsStageAllocCLutFloatGranular(NULL, grid, nIn, nOut, table);
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nIn, nOut);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* ---- Lab/XYZ conversion stage evals (slice 4 task 3) -----------------------
+   Each builds the corresponding lcms2 stage (_cmsStageAllocLab2XYZ etc.) in a
+   1-stage 3->3 pipeline and evaluates a 3-float input via cmsPipelineEvalFloat.
+   `which`: 0 = Lab2XYZ, 1 = XYZ2Lab, 2 = LabV2ToV4 (matrix form),
+   3 = LabV4ToV2 (matrix form). Returns 0 on alloc failure or bad `which`. */
+int rcms_oracle_labxyz_stage_eval(uint32_t which, const float* in, float* out) {
+    cmsStage* stage = NULL;
+    switch (which) {
+        case 0: stage = _cmsStageAllocLab2XYZ(NULL); break;
+        case 1: stage = _cmsStageAllocXYZ2Lab(NULL); break;
+        case 2: stage = _cmsStageAllocLabV2ToV4(NULL); break;
+        case 3: stage = _cmsStageAllocLabV4ToV2(NULL); break;
+        default: return 0;
+    }
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, 3, 3);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* ---- Combined CLUT -> curves -> matrix pipeline (slice 4 task 3) -----------
+   A 3-input CLUT stage (16-bit, `grid`/`clutTable`, nOut output channels),
+   feeding an nOut-channel ToneCurves stage (16-bit tabulated tables, each
+   tblLen long), feeding a rows x nOut matrix (+ optional offset). Evaluated via
+   cmsPipelineEvalFloat. Exercises a CLUT stage chained with curves and matrix.
+   nOut must equal both the curve count and the matrix cols. */
+int rcms_oracle_pipeline_clut_curves_matrix_eval_float(
+        const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+        const uint16_t* clutTable,
+        uint32_t tblLen, const uint16_t* curveTables,
+        uint32_t rows, const double* matrix, const double* offset,
+        const float* in, float* out) {
+    cmsStage* clut = cmsStageAllocCLut16bitGranular(NULL, grid, nIn, nOut, clutTable);
+    if (!clut) return 0;
+    cmsStage* curves = build_curves_stage(nOut, tblLen, curveTables);
+    if (!curves) { cmsStageFree(clut); return 0; }
+    cmsStage* mat = cmsStageAllocMatrix(NULL, rows, nOut, matrix, offset);
+    if (!mat) { cmsStageFree(clut); cmsStageFree(curves); return 0; }
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nIn, rows);
+    if (!lut) { cmsStageFree(clut); cmsStageFree(curves); cmsStageFree(mat); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, clut)) {
+        cmsStageFree(clut); cmsStageFree(curves); cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, curves)) {
+        cmsStageFree(curves); cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, mat)) {
+        cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
