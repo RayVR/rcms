@@ -13,6 +13,7 @@ pub mod error;
 pub mod fixed;
 pub mod io;
 pub mod math;
+pub mod pcs;
 pub mod profile;
 pub mod sig;
 

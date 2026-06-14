@@ -25,6 +25,82 @@ int      rcms_oracle_quick_floor(double v)         { return _cmsQuickFloor(v); }
 uint16_t rcms_oracle_quick_floor_word(double d)    { return _cmsQuickFloorWord(d); }
 uint16_t rcms_oracle_quick_saturate_word(double d) { return _cmsQuickSaturateWord(d); }
 
+/* PCS conversions (cmspcs.c). White point + value passed as flat doubles. A NULL
+   white point is signalled by passing wp == NULL; lcms2 then defaults to D50. */
+void rcms_oracle_xyz2lab(const double* wp, const double xyz[3], double lab[3]) {
+    cmsCIEXYZ WP; cmsCIEXYZ XYZ; cmsCIELab Lab;
+    XYZ.X = xyz[0]; XYZ.Y = xyz[1]; XYZ.Z = xyz[2];
+    if (wp) { WP.X = wp[0]; WP.Y = wp[1]; WP.Z = wp[2]; cmsXYZ2Lab(&WP, &Lab, &XYZ); }
+    else    { cmsXYZ2Lab(NULL, &Lab, &XYZ); }
+    lab[0] = Lab.L; lab[1] = Lab.a; lab[2] = Lab.b;
+}
+void rcms_oracle_lab2xyz(const double* wp, const double lab[3], double xyz[3]) {
+    cmsCIEXYZ WP; cmsCIEXYZ XYZ; cmsCIELab Lab;
+    Lab.L = lab[0]; Lab.a = lab[1]; Lab.b = lab[2];
+    if (wp) { WP.X = wp[0]; WP.Y = wp[1]; WP.Z = wp[2]; cmsLab2XYZ(&WP, &XYZ, &Lab); }
+    else    { cmsLab2XYZ(NULL, &XYZ, &Lab); }
+    xyz[0] = XYZ.X; xyz[1] = XYZ.Y; xyz[2] = XYZ.Z;
+}
+void rcms_oracle_xyz2xyy(const double xyz[3], double xyy[3]) {
+    cmsCIEXYZ XYZ; cmsCIExyY xyY;
+    XYZ.X = xyz[0]; XYZ.Y = xyz[1]; XYZ.Z = xyz[2];
+    cmsXYZ2xyY(&xyY, &XYZ);
+    xyy[0] = xyY.x; xyy[1] = xyY.y; xyy[2] = xyY.Y;
+}
+void rcms_oracle_xyy2xyz(const double xyy[3], double xyz[3]) {
+    cmsCIEXYZ XYZ; cmsCIExyY xyY;
+    xyY.x = xyy[0]; xyY.y = xyy[1]; xyY.Y = xyy[2];
+    cmsxyY2XYZ(&XYZ, &xyY);
+    xyz[0] = XYZ.X; xyz[1] = XYZ.Y; xyz[2] = XYZ.Z;
+}
+void rcms_oracle_lab2lch(const double lab[3], double lch[3]) {
+    cmsCIELab Lab; cmsCIELCh LCh;
+    Lab.L = lab[0]; Lab.a = lab[1]; Lab.b = lab[2];
+    cmsLab2LCh(&LCh, &Lab);
+    lch[0] = LCh.L; lch[1] = LCh.C; lch[2] = LCh.h;
+}
+void rcms_oracle_lch2lab(const double lch[3], double lab[3]) {
+    cmsCIELab Lab; cmsCIELCh LCh;
+    LCh.L = lch[0]; LCh.C = lch[1]; LCh.h = lch[2];
+    cmsLCh2Lab(&Lab, &LCh);
+    lab[0] = Lab.L; lab[1] = Lab.a; lab[2] = Lab.b;
+}
+/* Lab v4 / v2 encodings (16-bit). */
+void rcms_oracle_lab_enc2float_v4(const uint16_t wlab[3], double lab[3]) {
+    cmsCIELab Lab; cmsUInt16Number w[3] = { wlab[0], wlab[1], wlab[2] };
+    cmsLabEncoded2Float(&Lab, w);
+    lab[0] = Lab.L; lab[1] = Lab.a; lab[2] = Lab.b;
+}
+void rcms_oracle_float2lab_enc_v4(const double lab[3], uint16_t wlab[3]) {
+    cmsCIELab Lab; cmsUInt16Number w[3];
+    Lab.L = lab[0]; Lab.a = lab[1]; Lab.b = lab[2];
+    cmsFloat2LabEncoded(w, &Lab);
+    wlab[0] = w[0]; wlab[1] = w[1]; wlab[2] = w[2];
+}
+void rcms_oracle_lab_enc2float_v2(const uint16_t wlab[3], double lab[3]) {
+    cmsCIELab Lab; cmsUInt16Number w[3] = { wlab[0], wlab[1], wlab[2] };
+    cmsLabEncoded2FloatV2(&Lab, w);
+    lab[0] = Lab.L; lab[1] = Lab.a; lab[2] = Lab.b;
+}
+void rcms_oracle_float2lab_enc_v2(const double lab[3], uint16_t wlab[3]) {
+    cmsCIELab Lab; cmsUInt16Number w[3];
+    Lab.L = lab[0]; Lab.a = lab[1]; Lab.b = lab[2];
+    cmsFloat2LabEncodedV2(w, &Lab);
+    wlab[0] = w[0]; wlab[1] = w[1]; wlab[2] = w[2];
+}
+/* XYZ 1.15 fixed-point encoding. */
+void rcms_oracle_xyz_enc2float(const uint16_t wxyz[3], double xyz[3]) {
+    cmsCIEXYZ XYZ; cmsUInt16Number w[3] = { wxyz[0], wxyz[1], wxyz[2] };
+    cmsXYZEncoded2Float(&XYZ, w);
+    xyz[0] = XYZ.X; xyz[1] = XYZ.Y; xyz[2] = XYZ.Z;
+}
+void rcms_oracle_float2xyz_enc(const double xyz[3], uint16_t wxyz[3]) {
+    cmsCIEXYZ XYZ; cmsUInt16Number w[3];
+    XYZ.X = xyz[0]; XYZ.Y = xyz[1]; XYZ.Z = xyz[2];
+    cmsFloat2XYZEncoded(w, &XYZ);
+    wxyz[0] = w[0]; wxyz[1] = w[1]; wxyz[2] = w[2];
+}
+
 /* 3x3 matrix / 3-vector ops (cmsmtrx.c). */
 /* Mat3 row-major as 9 doubles; Vec3 as 3 doubles. */
 static void load_mat(cmsMAT3* M, const double m[9]) {

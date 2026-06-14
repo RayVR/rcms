@@ -14,6 +14,18 @@ unsafe extern "C" {
     fn rcms_oracle_quick_floor(v: f64) -> i32;
     fn rcms_oracle_quick_floor_word(d: f64) -> u16;
     fn rcms_oracle_quick_saturate_word(d: f64) -> u16;
+    fn rcms_oracle_xyz2lab(wp: *const f64, xyz: *const f64, lab: *mut f64);
+    fn rcms_oracle_lab2xyz(wp: *const f64, lab: *const f64, xyz: *mut f64);
+    fn rcms_oracle_xyz2xyy(xyz: *const f64, xyy: *mut f64);
+    fn rcms_oracle_xyy2xyz(xyy: *const f64, xyz: *mut f64);
+    fn rcms_oracle_lab2lch(lab: *const f64, lch: *mut f64);
+    fn rcms_oracle_lch2lab(lch: *const f64, lab: *mut f64);
+    fn rcms_oracle_lab_enc2float_v4(wlab: *const u16, lab: *mut f64);
+    fn rcms_oracle_float2lab_enc_v4(lab: *const f64, wlab: *mut u16);
+    fn rcms_oracle_lab_enc2float_v2(wlab: *const u16, lab: *mut f64);
+    fn rcms_oracle_float2lab_enc_v2(lab: *const f64, wlab: *mut u16);
+    fn rcms_oracle_xyz_enc2float(wxyz: *const u16, xyz: *mut f64);
+    fn rcms_oracle_float2xyz_enc(xyz: *const f64, wxyz: *mut u16);
     fn rcms_oracle_mat3_eval(out: *mut f64, m: *const f64, v: *const f64);
     fn rcms_oracle_mat3_per(out: *mut f64, a: *const f64, b: *const f64);
     fn rcms_oracle_mat3_inverse(out: *mut f64, a: *const f64) -> i32;
@@ -270,6 +282,96 @@ pub fn quick_floor_word(d: f64) -> u16 {
 pub fn quick_saturate_word(d: f64) -> u16 {
     // SAFETY: pure C arithmetic, no pointers, no allocation.
     unsafe { rcms_oracle_quick_saturate_word(d) }
+}
+
+/// lcms2 `cmsXYZ2Lab`. `wp == None` lets lcms2 default to D50 (it sees a NULL
+/// white point). Returns `[L, a, b]`.
+pub fn xyz2lab(wp: Option<[f64; 3]>, xyz: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    let wp_ptr = wp.as_ref().map_or(core::ptr::null(), |w| w.as_ptr());
+    // SAFETY: xyz/out are valid 3-double arrays C reads/writes; wp_ptr is either
+    // null (C defaults to D50) or points at a valid 3-double array C only reads.
+    unsafe { rcms_oracle_xyz2lab(wp_ptr, xyz.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLab2XYZ`. `wp == None` → D50. Returns `[X, Y, Z]`.
+pub fn lab2xyz(wp: Option<[f64; 3]>, lab: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    let wp_ptr = wp.as_ref().map_or(core::ptr::null(), |w| w.as_ptr());
+    // SAFETY: lab/out are valid 3-double arrays C reads/writes; wp_ptr is null or
+    // a valid 3-double array C only reads.
+    unsafe { rcms_oracle_lab2xyz(wp_ptr, lab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsXYZ2xyY`. Returns `[x, y, Y]`.
+pub fn xyz2xyy(xyz: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: xyz/out are valid 3-double arrays C reads/writes.
+    unsafe { rcms_oracle_xyz2xyy(xyz.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsxyY2XYZ`. Returns `[X, Y, Z]`.
+pub fn xyy2xyz(xyy: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: xyy/out are valid 3-double arrays C reads/writes.
+    unsafe { rcms_oracle_xyy2xyz(xyy.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLab2LCh`. Returns `[L, C, h]`.
+pub fn lab2lch(lab: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: lab/out are valid 3-double arrays C reads/writes.
+    unsafe { rcms_oracle_lab2lch(lab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLCh2Lab`. Returns `[L, a, b]`.
+pub fn lch2lab(lch: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: lch/out are valid 3-double arrays C reads/writes.
+    unsafe { rcms_oracle_lch2lab(lch.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLabEncoded2Float` (v4). Returns `[L, a, b]`.
+pub fn lab_enc2float_v4(wlab: &[u16; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: wlab is a valid 3-u16 array C reads; out a valid 3-double array C writes.
+    unsafe { rcms_oracle_lab_enc2float_v4(wlab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsFloat2LabEncoded` (v4). Returns `[L, a, b]` u16.
+pub fn float2lab_enc_v4(lab: &[f64; 3]) -> [u16; 3] {
+    let mut out = [0u16; 3];
+    // SAFETY: lab is a valid 3-double array C reads; out a valid 3-u16 array C writes.
+    unsafe { rcms_oracle_float2lab_enc_v4(lab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLabEncoded2FloatV2`. Returns `[L, a, b]`.
+pub fn lab_enc2float_v2(wlab: &[u16; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: wlab is a valid 3-u16 array C reads; out a valid 3-double array C writes.
+    unsafe { rcms_oracle_lab_enc2float_v2(wlab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsFloat2LabEncodedV2`. Returns `[L, a, b]` u16.
+pub fn float2lab_enc_v2(lab: &[f64; 3]) -> [u16; 3] {
+    let mut out = [0u16; 3];
+    // SAFETY: lab is a valid 3-double array C reads; out a valid 3-u16 array C writes.
+    unsafe { rcms_oracle_float2lab_enc_v2(lab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsXYZEncoded2Float`. Returns `[X, Y, Z]`.
+pub fn xyz_enc2float(wxyz: &[u16; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: wxyz is a valid 3-u16 array C reads; out a valid 3-double array C writes.
+    unsafe { rcms_oracle_xyz_enc2float(wxyz.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsFloat2XYZEncoded`. Returns `[X, Y, Z]` u16.
+pub fn float2xyz_enc(xyz: &[f64; 3]) -> [u16; 3] {
+    let mut out = [0u16; 3];
+    // SAFETY: xyz is a valid 3-double array C reads; out a valid 3-u16 array C writes.
+    unsafe { rcms_oracle_float2xyz_enc(xyz.as_ptr(), out.as_mut_ptr()) };
+    out
 }
 
 /// lcms2 `_cmsMAT3eval`.
@@ -1088,8 +1190,7 @@ mod transcendental_probe {
                     self.max_ulp = d;
                 }
                 if self.examples.len() < 3 {
-                    self.examples
-                        .push((desc(), rust.to_bits(), c.to_bits()));
+                    self.examples.push((desc(), rust.to_bits(), c.to_bits()));
                 }
             }
         }
