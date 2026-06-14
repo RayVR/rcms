@@ -1,5 +1,6 @@
 #include "lcms2_internal.h"
 #include <stdint.h>
+#include <stdlib.h>
 
 /* Fixed-point (cmsplugin.c:383). */
 int32_t rcms_oracle_double_to_s15f16(double v) { return (int32_t) _cmsDoubleTo15Fixed16(v); }
@@ -389,6 +390,68 @@ int rcms_oracle_read_tag_colorant_order(const uint8_t* buf, uint32_t len, uint32
     if (v && cap >= cmsMAXCHANNELS) {
         for (int i = 0; i < cmsMAXCHANNELS; i++) out[i] = v[i];
         n = cmsMAXCHANNELS;
+    }
+    cmsCloseProfile(p);
+    return n;
+}
+
+/* ---- MLU / TextDescription (cmsMLU) extractors ---------------------------- */
+/* Both cmsSigMultiLocalizedUnicodeType ('mluc') and cmsSigTextDescriptionType
+   ('desc') decode to a cmsMLU. cmsMLUtranslationsCount enumerates the records;
+   cmsMLUtranslationsCodes yields each record's language/country codes; passing
+   those exact codes to cmsMLUgetWide returns that record's wide string. */
+
+/* Number of translations in the tag's MLU, or -1 if the tag is absent / not an
+   MLU-backed type. */
+int rcms_oracle_mlu_count(const uint8_t* buf, uint32_t len, uint32_t sig) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return -1;
+    cmsMLU* mlu = (cmsMLU*) cmsReadTag(p, (cmsTagSignature) sig);
+    int n = -1;
+    if (mlu) n = (int) cmsMLUtranslationsCount(mlu);
+    cmsCloseProfile(p);
+    return n;
+}
+
+/* Translation `idx` of the tag's MLU. Writes the two language bytes and two
+   country bytes (raw, as strFrom16 splits the u16 wire code), and the wide
+   string as raw UTF-16 code units (one uint16_t each, NO surrogate pairing —
+   exactly the units lcms2 keeps in its wide pool) into `units` (up to `cap`).
+   Returns the number of code units written (excluding the implicit NUL), or -1
+   on failure. */
+int rcms_oracle_mlu_entry(const uint8_t* buf, uint32_t len, uint32_t sig,
+                          uint32_t idx, uint8_t lang[2], uint8_t country[2],
+                          uint16_t* units, uint32_t cap) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return -1;
+    cmsMLU* mlu = (cmsMLU*) cmsReadTag(p, (cmsTagSignature) sig);
+    int n = -1;
+    if (mlu) {
+        char L[3] = {0,0,0};
+        char C[3] = {0,0,0};
+        if (cmsMLUtranslationsCodes(mlu, idx, L, C)) {
+            lang[0] = (uint8_t) L[0]; lang[1] = (uint8_t) L[1];
+            country[0] = (uint8_t) C[0]; country[1] = (uint8_t) C[1];
+
+            /* Byte length of the wide string (including the NUL terminator). */
+            cmsUInt32Number bytes = cmsMLUgetWide(mlu, L, C, NULL, 0);
+            if (bytes >= sizeof(wchar_t)) {
+                cmsUInt32Number nchars = bytes / sizeof(wchar_t) - 1; /* drop NUL */
+                wchar_t* wide = (wchar_t*) malloc(bytes);
+                if (wide) {
+                    cmsMLUgetWide(mlu, L, C, wide, bytes);
+                    if (nchars <= cap) {
+                        for (cmsUInt32Number i = 0; i < nchars; i++)
+                            units[i] = (uint16_t) wide[i];
+                        n = (int) nchars;
+                    }
+                    free(wide);
+                }
+            } else {
+                /* Empty wide string is still a valid translation. */
+                n = 0;
+            }
+        }
     }
     cmsCloseProfile(p);
     return n;

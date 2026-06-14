@@ -183,7 +183,9 @@ fn elem_count(tag: &Tag) -> u32 {
         | Tag::Screening(_)
         | Tag::CrdInfo(_)
         | Tag::Cicp(_)
-        | Tag::ColorantTable(_) => 1,
+        | Tag::ColorantTable(_)
+        // Both Type_MLU_Read and Type_Text_Description_Read set *nItems = 1.
+        | Tag::Mlu(_) => 1,
     }
 }
 
@@ -568,6 +570,100 @@ mod tests {
         );
     }
 
+    /// Differential: every testbed profile carrying an `'mluc'`- or `'desc'`-typed
+    /// tag must decode to the same set of translations via rcms `read_tag` as via
+    /// lcms2's MLU API. We compare (a) the set of (language, country) codes against
+    /// `cmsMLUtranslationsCount`/`Codes`, and (b) for each code the decoded `text`
+    /// against `cmsMLUgetWide` (both decoded from the identical UTF-16 units, so
+    /// the comparison is over the same normalization).
+    #[test]
+    fn mlu_tag_values_match_oracle_over_testbed() {
+        use std::collections::BTreeMap;
+
+        const TY_MLUC: u32 = 0x6D6C_7563; // 'mluc'
+        const TY_DESC: u32 = 0x6465_7363; // 'desc'
+
+        let files = testbed_icc();
+        assert!(!files.is_empty(), "no .icc in testbed");
+
+        let mut exercised: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut translations_compared = 0usize;
+        let mut profiles_with_mlu = 0usize;
+
+        for path in &files {
+            let bytes = fs::read(path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+            if !rcms_oracle::open_succeeds(&bytes) {
+                continue;
+            }
+            let p = match Profile::open(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let mut hit_here = false;
+            for sig in p.tags().collect::<Vec<_>>() {
+                let raw = sig.to_raw();
+                let ty = match rcms_oracle::tag_true_type(&bytes, raw) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if ty != TY_MLUC && ty != TY_DESC {
+                    continue;
+                }
+
+                let oracle = rcms_oracle::mlu_entries(&bytes, raw).expect("oracle mlu");
+                let mlu = match p.read_tag(sig).expect("rust mlu") {
+                    Tag::Mlu(m) => m,
+                    other => panic!("{name}:{raw:08x} expected Mlu, got {other:?}"),
+                };
+
+                // Same number of translations.
+                assert_eq!(
+                    mlu.entries.len(),
+                    oracle.len(),
+                    "{name}:{raw:08x} translation count"
+                );
+
+                // Same (language, country) codes AND decoded text, in the same
+                // index order (lcms2 enumerates Entries[0..Count] in disk order;
+                // rcms preserves that order too).
+                for (i, (r, o)) in mlu.entries.iter().zip(oracle.iter()).enumerate() {
+                    assert_eq!(
+                        r.language, o.language,
+                        "{name}:{raw:08x}[{i}] language code"
+                    );
+                    assert_eq!(r.country, o.country, "{name}:{raw:08x}[{i}] country code");
+                    assert_eq!(r.text, o.text, "{name}:{raw:08x}[{i}] decoded text");
+                    translations_compared += 1;
+                }
+
+                *exercised.entry(ty).or_default() += 1;
+                hit_here = true;
+            }
+            if hit_here {
+                profiles_with_mlu += 1;
+            }
+        }
+
+        println!(
+            "mlu tag diff: {profiles_with_mlu} profiles carried mluc/desc tags; \
+             {translations_compared} translations compared; per-type tag counts:"
+        );
+        for (ty, n) in &exercised {
+            let b = ty.to_be_bytes();
+            let s: String = b.iter().map(|&c| c as char).collect();
+            println!("  '{s}' ({ty:08x}): {n}");
+        }
+
+        // The v4 testbed profiles carry mluc tags (profileDescription, copyright,
+        // …); require we exercised at least one.
+        assert!(
+            !exercised.is_empty(),
+            "expected at least one mluc/desc tag over the testbed"
+        );
+    }
+
     /// Reachability: each struct-shaped type's on-disk signature now dispatches to
     /// a reader (no longer `Error::Unsupported`). We feed a minimal valid payload
     /// straight through `read_tag_value` and assert it does NOT return the
@@ -604,6 +700,13 @@ mod tests {
         };
         let cicp = vec![1u8, 13, 0, 1];
         let clrt = 0u32.to_be_bytes().to_vec(); // count = 0
+        let mluc = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0u32.to_be_bytes()); // Count = 0
+            b.extend_from_slice(&12u32.to_be_bytes()); // RecLen = 12
+            b
+        };
+        let desc = 0u32.to_be_bytes().to_vec(); // AsciiCount = 0
 
         for (ty, body) in [
             (0x6D65_6173u32, meas), // 'meas'
@@ -612,6 +715,8 @@ mod tests {
             (0x6372_6469, crdi),    // 'crdi'
             (0x6369_6370, cicp),    // 'cicp'
             (0x636C_7274, clrt),    // 'clrt'
+            (0x6D6C_7563, mluc),    // 'mluc'
+            (0x6465_7363, desc),    // 'desc'
         ] {
             let mut r = MemReader::new(&body);
             let res = read_tag_value(Signature::from_raw(ty), &mut r, body.len() as u32);

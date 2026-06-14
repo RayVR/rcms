@@ -67,6 +67,17 @@ unsafe extern "C" {
         out_u32: *mut u32,
         out_f64: *mut f64,
     ) -> i32;
+    fn rcms_oracle_mlu_count(buf: *const u8, len: u32, sig: u32) -> i32;
+    fn rcms_oracle_mlu_entry(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        idx: u32,
+        lang: *mut u8,
+        country: *mut u8,
+        units: *mut u16,
+        cap: u32,
+    ) -> i32;
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
@@ -532,6 +543,68 @@ pub fn read_tag_measurement(buf: &[u8], sig: u32) -> Option<([u32; 3], [f64; 4])
     } else {
         None
     }
+}
+
+/// One MLU translation as lcms2 exposes it: the raw language/country code bytes
+/// (`cmsMLUtranslationsCodes`) and the wide string decoded from lcms2's raw
+/// UTF-16 code units (`cmsMLUgetWide`) via [`char::decode_utf16`] — the same
+/// normalization rcms applies to the identical units.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleMluEntry {
+    pub language: [u8; 2],
+    pub country: [u8; 2],
+    pub text: String,
+}
+
+/// lcms2 `cmsMLUtranslationsCount` for an `mluc`/`desc` tag, or `None`.
+pub fn mlu_count(buf: &[u8], sig: u32) -> Option<u32> {
+    // SAFETY: buf/len describe a valid readable slice C only reads.
+    let n = unsafe { rcms_oracle_mlu_count(buf.as_ptr(), buf.len() as u32, sig) };
+    if n >= 0 {
+        Some(n as u32)
+    } else {
+        None
+    }
+}
+
+/// All translations of an `mluc`/`desc` tag, in `cmsMLUtranslationsCodes` index
+/// order, or `None` if the tag is absent / not MLU-backed.
+pub fn mlu_entries(buf: &[u8], sig: u32) -> Option<Vec<OracleMluEntry>> {
+    let count = mlu_count(buf, sig)?;
+    let cap = 1usize << 20; // wide strings in the testbed are far under 1M units
+    let mut out = Vec::with_capacity(count as usize);
+    for idx in 0..count {
+        let mut lang = [0u8; 2];
+        let mut country = [0u8; 2];
+        let mut units = vec![0u16; cap];
+        // SAFETY: buf/len describe a valid readable slice; lang/country are 2-byte
+        // arrays and units has `cap` u16 of room — exactly the bounds C respects.
+        let n = unsafe {
+            rcms_oracle_mlu_entry(
+                buf.as_ptr(),
+                buf.len() as u32,
+                sig,
+                idx,
+                lang.as_mut_ptr(),
+                country.as_mut_ptr(),
+                units.as_mut_ptr(),
+                cap as u32,
+            )
+        };
+        if n < 0 {
+            return None;
+        }
+        units.truncate(n as usize);
+        let text = char::decode_utf16(units.into_iter())
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+        out.push(OracleMluEntry {
+            language: lang,
+            country,
+            text,
+        });
+    }
+    Some(out)
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.

@@ -3,6 +3,7 @@
 //! (`cmstypes.c`), but only the trivial types (slice-2 task 3) are wired up;
 //! every other (struct-shaped / deferred) type returns `Error::Unsupported`.
 
+pub mod mlu;
 pub mod structs;
 pub mod trivial;
 
@@ -31,6 +32,8 @@ const T_SCREENING: u32 = 0x7363_726E; // 'scrn'
 const T_CRD_INFO: u32 = 0x6372_6469; // 'crdi'
 const T_CICP: u32 = 0x6369_6370; // 'cicp'
 const T_COLORANT_TABLE: u32 = 0x636C_7274; // 'clrt'
+const T_MLU: u32 = 0x6D6C_7563; // 'mluc'
+const T_TEXT_DESCRIPTION: u32 = 0x6465_7363; // 'desc'
 
 /// Decode the tag value for the on-disk `type_sig`. `r` is positioned at the
 /// start of the type payload (already past the 8-byte type base); `size` is the
@@ -55,6 +58,8 @@ pub fn read_tag_value<R: ProfileReader>(type_sig: Signature, r: &mut R, size: u3
         T_CRD_INFO => structs::read_crd_info(r, size),
         T_CICP => structs::read_cicp(r, size),
         T_COLORANT_TABLE => structs::read_colorant_table(r, size),
+        T_MLU => mlu::read_mlu(r, size),
+        T_TEXT_DESCRIPTION => mlu::read_text_description(r, size),
         _ => Err(Error::Unsupported("tag type deferred to a later slice")),
     }
 }

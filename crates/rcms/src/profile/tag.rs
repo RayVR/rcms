@@ -61,6 +61,37 @@ pub enum Tag {
     /// `cmsSigColorantTableType` (`'clrt'`): a count-prefixed list of named
     /// colorants, each a 32-byte name plus a 3×u16 PCS. (`cmstypes.c:3254`).
     ColorantTable(Vec<ColorantTableEntry>),
+    /// `cmsSigMultiLocalizedUnicodeType` (`'mluc'`, `Type_MLU_Read`,
+    /// `cmstypes.c:1677`) AND `cmsSigTextDescriptionType` (`'desc'`,
+    /// `Type_Text_Description_Read`, `cmstypes.c:1096`). Both decode in lcms2 to a
+    /// `cmsMLU`, so they share one Rust value. (`textDescription` is the ICC v2
+    /// form that an ICC v4 profile would carry as `mluc`.)
+    Mlu(Mlu),
+}
+
+/// One localized record of a `cmsMLU` (`_cmsMLUentry`, `cmsnamed.c`): a 2-byte
+/// ISO-639 language code, a 2-byte ISO-3166 country code (both raw, byte-for-byte
+/// as on disk — lcms2 keeps them as the big-endian u16 wire value and `strFrom16`
+/// splits that back into two bytes), and the decoded text.
+///
+/// `text` is the entry's UTF-16BE string pool slice decoded with
+/// [`char::decode_utf16`] (U+FFFD on lone surrogates) — the exact code-unit
+/// sequence lcms2 keeps in its wide `MemPool`. lcms2 reads each UTF-16BE unit
+/// straight into a `wchar_t` with NO surrogate pairing (`_cmsReadWCharArray`);
+/// decoding the identical unit sequence is the faithful comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MluEntry {
+    pub language: [u8; 2],
+    pub country: [u8; 2],
+    pub text: String,
+}
+
+/// A `cmsMLU` (multi-localized unicode): an ordered set of localized strings.
+/// `entries` preserves the on-disk record order (lcms2 keeps `Entries[0..Count]`
+/// in directory order), which `cmsMLUtranslationsCodes` enumerates by index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mlu {
+    pub entries: Vec<MluEntry>,
 }
 
 /// `cmsICCMeasurementConditions` (`include/lcms2.h:1051`). `flare` is the
