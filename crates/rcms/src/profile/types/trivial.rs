@@ -171,7 +171,213 @@ pub fn read_colorant_order<R: ProfileReader>(r: &mut R, _size: u32) -> Result<Ta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixed::U16Fixed16;
     use crate::io::MemReader;
+    use crate::profile::header::DateTime;
+    use crate::profile::types::read_tag_value;
+    use crate::sig::Signature;
+
+    // ---- Part A: synthetic tests for the six trivial types with no testbed coverage ----
+    //
+    // Approach for every type: hand-build the body bytes (past the 8-byte type base),
+    // call read_tag_value with the payload and hand-computed expected values.
+    // The 8-byte type base is consumed by read_type_base in the real dispatch path, so
+    // we drive these through read_tag_value with a MemReader positioned at the BODY
+    // (exactly as the dispatch machinery does after consuming the base).
+
+    /// `'data'` (DataType): flag=0 (ASCII), 3 bytes of data.
+    #[test]
+    fn synthetic_data() {
+        // Body (past the 8-byte type base): flag(4) + data bytes.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_be_bytes()); // flag = 0 (ASCII flag)
+        body.extend_from_slice(b"hi!"); // 3 data bytes
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x6461_7461), &mut r, body.len() as u32)
+            .expect("data tag");
+        match tag {
+            Tag::Data { flag, data } => {
+                assert_eq!(flag, 0, "data flag");
+                assert_eq!(data, b"hi!", "data bytes");
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    /// `'data'` with flag=1 (binary), empty payload.
+    #[test]
+    fn synthetic_data_binary_empty() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes()); // flag = 1 (binary)
+                                                     // no data bytes
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x6461_7461), &mut r, body.len() as u32)
+            .expect("data binary empty");
+        match tag {
+            Tag::Data { flag, data } => {
+                assert_eq!(flag, 1);
+                assert!(data.is_empty());
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    /// `'ui08'` (UInt8ArrayType): 4 bytes → U8Array.
+    #[test]
+    fn synthetic_ui08() {
+        let body: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x7569_3038), &mut r, body.len() as u32)
+            .expect("ui08 tag");
+        match tag {
+            Tag::U8Array(v) => assert_eq!(v, [0xDE, 0xAD, 0xBE, 0xEF]),
+            other => panic!("expected U8Array, got {other:?}"),
+        }
+    }
+
+    /// `'ui08'` zero-length body → empty array.
+    #[test]
+    fn synthetic_ui08_empty() {
+        let body: Vec<u8> = vec![];
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x7569_3038), &mut r, 0).expect("ui08 empty");
+        match tag {
+            Tag::U8Array(v) => assert!(v.is_empty()),
+            other => panic!("expected U8Array, got {other:?}"),
+        }
+    }
+
+    /// `'ui32'` (UInt32ArrayType): 2 big-endian u32 → U32Array.
+    #[test]
+    fn synthetic_ui32() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0000_0001u32.to_be_bytes());
+        body.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x7569_3332), &mut r, body.len() as u32)
+            .expect("ui32 tag");
+        match tag {
+            Tag::U32Array(v) => assert_eq!(v, [1u32, 0xFFFF_FFFF]),
+            other => panic!("expected U32Array, got {other:?}"),
+        }
+    }
+
+    /// `'ui32'` zero-length body → empty array.
+    #[test]
+    fn synthetic_ui32_empty() {
+        let body: Vec<u8> = vec![];
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x7569_3332), &mut r, 0).expect("ui32 empty");
+        match tag {
+            Tag::U32Array(v) => assert!(v.is_empty()),
+            other => panic!("expected U32Array, got {other:?}"),
+        }
+    }
+
+    /// `'dtim'` (DateTimeType): six big-endian u16: year, month, day, hours,
+    /// minutes, seconds.
+    #[test]
+    fn synthetic_dtim() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&2024u16.to_be_bytes()); // year
+        body.extend_from_slice(&12u16.to_be_bytes()); // month
+        body.extend_from_slice(&31u16.to_be_bytes()); // day
+        body.extend_from_slice(&23u16.to_be_bytes()); // hours
+        body.extend_from_slice(&59u16.to_be_bytes()); // minutes
+        body.extend_from_slice(&58u16.to_be_bytes()); // seconds
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x6474_696D), &mut r, body.len() as u32)
+            .expect("dtim tag");
+        match tag {
+            Tag::DateTime(d) => {
+                assert_eq!(
+                    d,
+                    DateTime {
+                        year: 2024,
+                        month: 12,
+                        day: 31,
+                        hours: 23,
+                        minutes: 59,
+                        seconds: 58,
+                    }
+                );
+            }
+            other => panic!("expected DateTime, got {other:?}"),
+        }
+    }
+
+    /// `'clro'` (ColorantOrderType): count=3, ordering bytes [2, 0, 1].
+    #[test]
+    fn synthetic_clro() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_be_bytes()); // count
+        body.extend_from_slice(&[2u8, 0, 1]); // ordering
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x636C_726F), &mut r, body.len() as u32)
+            .expect("clro tag");
+        match tag {
+            Tag::ColorantOrder(order) => assert_eq!(order, [2u8, 0, 1]),
+            other => panic!("expected ColorantOrder, got {other:?}"),
+        }
+    }
+
+    /// `'clro'` count=0 → empty ordering.
+    #[test]
+    fn synthetic_clro_empty() {
+        let body = 0u32.to_be_bytes().to_vec(); // count = 0
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x636C_726F), &mut r, body.len() as u32)
+            .expect("clro empty");
+        match tag {
+            Tag::ColorantOrder(order) => assert!(order.is_empty()),
+            other => panic!("expected ColorantOrder, got {other:?}"),
+        }
+    }
+
+    /// `'uf32'` (U16Fixed16ArrayType): 3 raw u32 values, read back as U16Fixed16.
+    /// Raw 0x0001_0000 = 1.0, 0x0001_8000 = 1.5, 0x0000_8000 = 0.5 in u16.16
+    /// fixed-point (raw / 65536). We verify the raw bit representation is preserved
+    /// exactly (U16Fixed16 keeps the raw u32; no lossy conversion is applied here).
+    #[test]
+    fn synthetic_uf32() {
+        // 0x0001_0000 = 1.0, 0x0001_8000 = 1.5, 0x0000_8000 = 0.5
+        let raws: [u32; 3] = [0x0001_0000, 0x0001_8000, 0x0000_8000];
+        let mut body = Vec::new();
+        for v in raws {
+            body.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x7566_3332), &mut r, body.len() as u32)
+            .expect("uf32 tag");
+        match tag {
+            Tag::U16Fixed16Array(v) => {
+                assert_eq!(v.len(), 3);
+                // Verify raw bit representation is preserved exactly.
+                assert_eq!(v[0], U16Fixed16::from_raw(0x0001_0000));
+                assert_eq!(v[1], U16Fixed16::from_raw(0x0001_8000));
+                assert_eq!(v[2], U16Fixed16::from_raw(0x0000_8000));
+                // Cross-check via to_raw() that the round-trip is lossless.
+                assert_eq!(v[0].to_raw(), 0x0001_0000u32);
+                assert_eq!(v[1].to_raw(), 0x0001_8000u32);
+                assert_eq!(v[2].to_raw(), 0x0000_8000u32);
+            }
+            other => panic!("expected U16Fixed16Array, got {other:?}"),
+        }
+    }
+
+    /// `'uf32'` zero-length body → empty array.
+    #[test]
+    fn synthetic_uf32_empty() {
+        let body: Vec<u8> = vec![];
+        let mut r = MemReader::new(&body);
+        let tag = read_tag_value(Signature::from_raw(0x7566_3332), &mut r, 0).expect("uf32 empty");
+        match tag {
+            Tag::U16Fixed16Array(v) => assert!(v.is_empty()),
+            other => panic!("expected U16Fixed16Array, got {other:?}"),
+        }
+    }
+
+    // ---- End Part A ----
 
     /// Synthesize the lcms1-bug Chromaticity case: a 32-byte payload whose first
     /// u16 channel count is 0, followed by a spurious u16, then the *real* count

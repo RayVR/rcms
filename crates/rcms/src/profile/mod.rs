@@ -867,6 +867,184 @@ mod tests {
         }
     }
 
+    // ---- Part B: comprehensive done-criteria testbed sweep ----
+
+    /// On-disk tag-TYPE signatures that are implemented (in-scope): the full set
+    /// dispatched in `crate::profile::types::read_tag_value`. Any tag whose on-disk
+    /// type is in this set MUST succeed (`Ok`) from `read_tag`.
+    const INSCOPE_TYPES: &[u32] = &[
+        0x5859_5A20, // 'XYZ '
+        0x17A5_05B8, // Corbis broken XYZ (mapped to XYZ)
+        0x7366_3332, // 'sf32' S15Fixed16Array
+        0x7566_3332, // 'uf32' U16Fixed16Array
+        0x7569_3038, // 'ui08' UInt8Array
+        0x7569_3332, // 'ui32' UInt32Array
+        0x7369_6720, // 'sig ' Signature
+        0x6461_7461, // 'data' Data
+        0x6474_696D, // 'dtim' DateTime
+        0x6368_726D, // 'chrm' Chromaticity
+        0x7465_7874, // 'text' Text
+        0x636C_726F, // 'clro' ColorantOrder
+        0x6D65_6173, // 'meas' Measurement
+        0x7669_6577, // 'view' ViewingConditions
+        0x7363_726E, // 'scrn' Screening
+        0x6372_6469, // 'crdi' CrdInfo
+        0x6369_6370, // 'cicp' Cicp
+        0x636C_7274, // 'clrt' ColorantTable
+        0x6D6C_7563, // 'mluc' Mlu
+        0x6465_7363, // 'desc' TextDescription (decoded as Mlu)
+        0x6E63_6C32, // 'ncl2' NamedColor2
+        0x7073_6571, // 'pseq' ProfileSequenceDesc
+        0x7073_6964, // 'psid' ProfileSequenceId
+        0x6469_6374, // 'dict' Dictionary
+    ];
+
+    /// Comprehensive testbed sweep: for every `vendor/Little-CMS/testbed/*.icc`:
+    ///
+    /// 1. Accept/reject agrees with lcms2 `cmsOpenProfileFromMem`.
+    /// 2. For each tag in accepted profiles: `read_tag` never panics, returns either
+    ///    `Ok(tag)` OR `Err(Unsupported)`.
+    /// 3. `Err(Unsupported)` occurs ONLY when the on-disk type is NOT in the
+    ///    in-scope set (i.e. is genuinely a deferred type like `curv`/`para`/LUTs).
+    ///    An in-scope type that returns `Unsupported` is a BUG and fails the test.
+    /// 4. Prints a summary: profiles, tags total, in-scope (Ok), deferred
+    ///    (Unsupported), and the distribution of deferred on-disk types.
+    #[test]
+    fn comprehensive_testbed_sweep() {
+        use std::collections::BTreeMap;
+
+        let files = testbed_icc();
+        assert!(!files.is_empty(), "no .icc in testbed");
+
+        let mut n_profiles = 0usize;
+        let mut n_tags_total = 0usize;
+        let mut n_inscope_ok = 0usize;
+        let mut n_deferred = 0usize;
+        // Map from on-disk type sig → count of tags that returned Unsupported.
+        let mut deferred_by_type: BTreeMap<u32, usize> = BTreeMap::new();
+
+        for path in &files {
+            let bytes = fs::read(path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+
+            let oracle_ok = rcms_oracle::open_succeeds(&bytes);
+            let rust = Profile::open(&bytes);
+
+            // 1. Accept/reject must agree with lcms2.
+            assert_eq!(
+                rust.is_ok(),
+                oracle_ok,
+                "[sweep] open accept/reject disagree on {name}: rust={:?} lcms2={oracle_ok}",
+                rust.as_ref().err()
+            );
+
+            if !oracle_ok {
+                continue; // Both reject — nothing more to test.
+            }
+
+            n_profiles += 1;
+            let p = rust.unwrap();
+
+            for sig in p.tags().collect::<Vec<_>>() {
+                n_tags_total += 1;
+                let raw_sig = sig.to_raw();
+
+                // Determine the on-disk type so we know whether Unsupported is legitimate.
+                let on_disk_type = rcms_oracle::tag_true_type(&bytes, raw_sig);
+
+                // 2. read_tag must not panic and must return Ok or Err(Unsupported).
+                let result = p.read_tag(sig);
+                match &result {
+                    Ok(_) => {
+                        n_inscope_ok += 1;
+                        // 3a. If it's Ok, the on-disk type must be in-scope. If the
+                        //     oracle can't even tell us the type it's fine (linked/unknown);
+                        //     but if it IS known it should be in the in-scope set.
+                        if let Some(ty) = on_disk_type {
+                            assert!(
+                                INSCOPE_TYPES.contains(&ty),
+                                "[sweep] {name}:{raw_sig:08x} read_tag returned Ok but on-disk type \
+                                 {ty:08x} is not in the in-scope set — unexpected success",
+                            );
+                        }
+                    }
+                    Err(Error::Unsupported(_)) => {
+                        // 3b. Unsupported is only legitimate for deferred on-disk types.
+                        if let Some(ty) = on_disk_type {
+                            assert!(
+                                !INSCOPE_TYPES.contains(&ty),
+                                "[sweep] {name}:{raw_sig:08x} read_tag returned Unsupported but \
+                                 on-disk type {ty:08x} is in-scope — this is a BUG (tag sig \
+                                 {raw_sig:08x}, type {ty:08x})",
+                            );
+                            *deferred_by_type.entry(ty).or_default() += 1;
+                        }
+                        n_deferred += 1;
+                    }
+                    Err(other) => {
+                        // Any error other than Unsupported for a tag whose on-disk type IS
+                        // in-scope is a bug. BadType, Corrupt, or Range are expected when:
+                        //   - The tag has an unknown descriptor (rcms returns BadType).
+                        //   - The tag has a known descriptor but a mismatched on-disk type
+                        //     (e.g., an in-scope tag carrying an unrecognized type sig).
+                        //   - Data is genuinely corrupt.
+                        // These are NOT bugs — they represent lcms2's own BadType / corrupt
+                        // path, not an rcms deficiency.
+                        let ok =
+                            matches!(other, Error::BadType(_) | Error::Range | Error::Corrupt(_));
+                        assert!(
+                            ok,
+                            "[sweep] {name}:{raw_sig:08x} read_tag returned unexpected \
+                             error {other:?} — should be Ok, Unsupported, BadType, or Corrupt"
+                        );
+                        // Verify: if the on-disk type IS in-scope, this error is a bug.
+                        if let Some(ty) = on_disk_type {
+                            assert!(
+                                !INSCOPE_TYPES.contains(&ty),
+                                "[sweep] {name}:{raw_sig:08x} INSCOPE type {ty:08x} returned \
+                                 non-Unsupported error {other:?} — this is a rcms bug",
+                            );
+                        }
+                        // Count these as "other" — not in-scope-Ok, not deferred-Unsupported.
+                    }
+                }
+            }
+        }
+
+        // Print the summary (visible with --nocapture).
+        eprintln!(
+            "\n=== Comprehensive testbed sweep ===\n\
+             Profiles accepted: {n_profiles}/{total_files}\n\
+             Tags total:        {n_tags_total}\n\
+             In-scope (Ok):     {n_inscope_ok}\n\
+             Deferred (Unsupported): {n_deferred}",
+            total_files = files.len()
+        );
+        if deferred_by_type.is_empty() {
+            eprintln!("  (no deferred-type tags encountered)");
+        } else {
+            eprintln!("  Deferred on-disk type distribution:");
+            for (ty, count) in &deferred_by_type {
+                let b = ty.to_be_bytes();
+                let label: String = b
+                    .iter()
+                    .map(|&c| if c.is_ascii_graphic() { c as char } else { '?' })
+                    .collect();
+                eprintln!("    '{label}' ({ty:08x}): {count} tag(s)");
+            }
+        }
+        eprintln!("===================================\n");
+
+        assert!(n_profiles > 0, "expected at least one accepted profile");
+        assert!(
+            n_tags_total > 0,
+            "expected at least one tag over all profiles"
+        );
+        assert!(n_inscope_ok > 0, "expected at least one in-scope Ok tag");
+    }
+
+    // ---- End Part B ----
+
     /// Reachability: NamedColor2 / ProfileSequence{Desc,Id} / Dictionary now
     /// dispatch (no longer `Error::Unsupported`). Minimal valid payloads are fed
     /// straight through `read_tag_value`; per-field correctness lives in the
