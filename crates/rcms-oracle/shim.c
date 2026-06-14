@@ -1,6 +1,16 @@
 #include "lcms2_internal.h"
 #include <stdint.h>
 #include <stdlib.h>
+#include <math.h>
+
+/* ---- TEMPORARY transcendental parity probe (slice 3 de-risk) -------------- */
+/* These expose the exact C libm functions lcms2's parametric curve evaluator
+   uses (pow/log/log10) so a Rust test can compare bit patterns against
+   f64::powf/ln/log10. KEPT after the probe: slice 3's parametric tone-curve
+   differential tests will want a pow/log oracle regardless of the outcome. */
+double rcms_oracle_pow(double x, double y) { return pow(x, y); }
+double rcms_oracle_log(double x)           { return log(x); }
+double rcms_oracle_log10(double x)         { return log10(x); }
 
 /* Fixed-point (cmsplugin.c:383). */
 int32_t rcms_oracle_double_to_s15f16(double v) { return (int32_t) _cmsDoubleTo15Fixed16(v); }

@@ -2,6 +2,10 @@
 //! for bit-for-bit comparison against `rcms`.
 
 unsafe extern "C" {
+    // TEMPORARY transcendental parity probe (slice 3 de-risk). KEPT.
+    fn rcms_oracle_pow(x: f64, y: f64) -> f64;
+    fn rcms_oracle_log(x: f64) -> f64;
+    fn rcms_oracle_log10(x: f64) -> f64;
     fn rcms_oracle_double_to_s15f16(v: f64) -> i32;
     fn rcms_oracle_s15f16_to_double(a: i32) -> f64;
     fn rcms_oracle_double_to_8fixed8(v: f64) -> u16;
@@ -211,6 +215,23 @@ pub fn tag_signatures(buf: &[u8]) -> Option<Vec<u32>> {
         sigs.push(sig);
     }
     Some(sigs)
+}
+
+/// C libm `pow(x, y)` — the exact function lcms2's parametric curve evaluator
+/// calls. TEMPORARY transcendental parity probe (slice 3 de-risk); KEPT.
+pub fn libm_pow(x: f64, y: f64) -> f64 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_pow(x, y) }
+}
+/// C libm `log(x)` (natural log). TEMPORARY parity probe; KEPT.
+pub fn libm_log(x: f64) -> f64 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_log(x) }
+}
+/// C libm `log10(x)`. TEMPORARY parity probe; KEPT.
+pub fn libm_log10(x: f64) -> f64 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_log10(x) }
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
@@ -1010,5 +1031,160 @@ mod tests {
     #[test]
     fn oracle_links() {
         assert_eq!(super::double_to_s15f16(1.0), 65536); // 1.0 -> 65536 in 15.16
+    }
+}
+
+/// TEMPORARY transcendental parity probe (slice 3 de-risk). Sweeps millions of
+/// inputs comparing Rust std math (`f64::powf`/`ln`/`log10`) against the C libm
+/// the lcms2 oracle links. Run with:
+///   cargo test -p rcms-oracle --release transcendental_parity_probe -- --nocapture --ignored
+/// Marked `#[ignore]` so it does not run in the normal suite (it is a one-shot
+/// architectural probe, not a regression test). Safe to delete once slice 3 has
+/// committed to a math strategy.
+#[cfg(test)]
+mod transcendental_probe {
+    use super::{libm_log, libm_log10, libm_pow, Rng};
+
+    /// ULP distance between two finite f64 by their bit representations, using
+    /// the IEEE-754 total-order mapping so the integer subtraction is a genuine
+    /// ULP count even across the sign boundary.
+    fn ulp_delta(a: f64, b: f64) -> u64 {
+        monotone(a).wrapping_sub(monotone(b)).unsigned_abs()
+    }
+
+    /// Map an f64 to a monotonically increasing i64 (IEEE-754 total order), so
+    /// integer difference == ULP count. NaNs are not expected on our inputs.
+    fn monotone(x: f64) -> i64 {
+        let b = x.to_bits() as i64;
+        // For negatives, IEEE bit order runs backwards; flip to a continuous line.
+        if b < 0 {
+            i64::MIN.wrapping_sub(b)
+        } else {
+            b
+        }
+    }
+
+    struct Stats {
+        total: u64,
+        mismatches: u64,
+        max_ulp: u64,
+        examples: Vec<(String, u64, u64)>, // (input desc, rust_bits, c_bits)
+    }
+    impl Stats {
+        fn new() -> Self {
+            Stats {
+                total: 0,
+                mismatches: 0,
+                max_ulp: 0,
+                examples: Vec::new(),
+            }
+        }
+        fn record(&mut self, desc: impl FnOnce() -> String, rust: f64, c: f64) {
+            self.total += 1;
+            if rust.to_bits() != c.to_bits() {
+                self.mismatches += 1;
+                let d = ulp_delta(rust, c);
+                if d > self.max_ulp {
+                    self.max_ulp = d;
+                }
+                if self.examples.len() < 3 {
+                    self.examples
+                        .push((desc(), rust.to_bits(), c.to_bits()));
+                }
+            }
+        }
+        fn report(&self, name: &str) {
+            println!(
+                "=== {name}: total={} mismatches={} max_ulp={}",
+                self.total, self.mismatches, self.max_ulp
+            );
+            for (i, (d, rb, cb)) in self.examples.iter().enumerate() {
+                println!(
+                    "    example[{i}] input={d} rust_bits=0x{rb:016x} c_bits=0x{cb:016x} (ulp={})",
+                    ulp_delta(f64::from_bits(*rb), f64::from_bits(*cb))
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "one-shot architectural probe; run explicitly with --nocapture --ignored"]
+    fn transcendental_parity_probe() {
+        let n_per: u64 = 3_000_000;
+        let mut rng = Rng::new(0x5113_3DE_0000_0003_u64 ^ 0x9E37_79B9_7F4A_7C15);
+
+        // ---- pow: x in (0,4], y in [0.2,5.0] ----
+        let mut pow_stats = Stats::new();
+        for _ in 0..n_per {
+            let x = rng.next_f64_unit() * 4.0; // (0,4]
+            let x = if x == 0.0 { f64::MIN_POSITIVE } else { x };
+            let y = 0.2 + rng.next_f64_unit() * (5.0 - 0.2); // [0.2,5.0]
+            let r = x.powf(y);
+            let c = libm_pow(x, y);
+            pow_stats.record(|| format!("pow(x={x:e}, y={y:e})"), r, c);
+        }
+        // Edge cases.
+        let pow_edges: &[(f64, f64)] = &[
+            (1.0, 1.0),
+            (1.0, 2.4),
+            (1.0, 1.0 / 2.4),
+            (0.0, 2.4),
+            (f64::MIN_POSITIVE, 2.4),
+            (1e-300, 2.4),
+            (0.5, 2.4),
+            (0.5, 1.0 / 2.4),
+            (2.0, 2.4),
+            (4.0, 5.0),
+            (0.04045, 2.4),
+            (0.0031308, 1.0 / 2.4),
+        ];
+        for &(x, y) in pow_edges {
+            let r = x.powf(y);
+            let c = libm_pow(x, y);
+            pow_stats.record(|| format!("pow_edge(x={x:e}, y={y:e})"), r, c);
+        }
+        pow_stats.report("pow  (x in (0,4], y in [0.2,5.0])");
+
+        // ---- log (natural): x in (0,10] ----
+        let mut log_stats = Stats::new();
+        for _ in 0..n_per {
+            let x = rng.next_f64_unit() * 10.0;
+            let x = if x == 0.0 { f64::MIN_POSITIVE } else { x };
+            let r = x.ln();
+            let c = libm_log(x);
+            log_stats.record(|| format!("log(x={x:e})"), r, c);
+        }
+        for &x in &[1.0_f64, 2.0, std::f64::consts::E, 0.5, 1e-300, 10.0] {
+            let r = x.ln();
+            let c = libm_log(x);
+            log_stats.record(|| format!("log_edge(x={x:e})"), r, c);
+        }
+        log_stats.report("log  (x in (0,10])");
+
+        // ---- log10: x in (0,10] ----
+        let mut log10_stats = Stats::new();
+        for _ in 0..n_per {
+            let x = rng.next_f64_unit() * 10.0;
+            let x = if x == 0.0 { f64::MIN_POSITIVE } else { x };
+            let r = x.log10();
+            let c = libm_log10(x);
+            log10_stats.record(|| format!("log10(x={x:e})"), r, c);
+        }
+        for &x in &[1.0_f64, 10.0, 100.0, 0.1, 0.5, 1e-300] {
+            let r = x.log10();
+            let c = libm_log10(x);
+            log10_stats.record(|| format!("log10_edge(x={x:e})"), r, c);
+        }
+        log10_stats.report("log10 (x in (0,10])");
+
+        println!(
+            "\n=== VERDICT: pow_mismatch={}/{} log_mismatch={}/{} log10_mismatch={}/{} ===",
+            pow_stats.mismatches,
+            pow_stats.total,
+            log_stats.mismatches,
+            log_stats.total,
+            log10_stats.mismatches,
+            log10_stats.total
+        );
     }
 }
