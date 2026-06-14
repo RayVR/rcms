@@ -178,3 +178,36 @@ int rcms_oracle_read_header(const uint8_t* buf, uint32_t len, rcms_oracle_header
     cmsCloseProfile(p);
     return 1;
 }
+
+/* Full open (header + tag directory + duplicate check) over the WHOLE profile
+   bytes. cmsOpenProfileFromMem runs _cmsReadHeader, which validates the header
+   AND parses the tag directory (sanity skips, link detection, dup rejection).
+   Returns 1 if lcms2 accepts the profile, else 0. This is the accept/reject
+   decision the rcms Profile::open must agree with. */
+int rcms_oracle_open_succeeds(const uint8_t* buf, uint32_t len) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsCloseProfile(p);
+    return 1;
+}
+
+/* Number of accepted tags in the directory (cmsGetTagCount). Returns -1 if the
+   profile cannot be opened. */
+int rcms_oracle_tag_count(const uint8_t* buf, uint32_t len) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return -1;
+    cmsInt32Number n = cmsGetTagCount(p);
+    cmsCloseProfile(p);
+    return (int) n;
+}
+
+/* The n-th accepted tag signature (cmsGetTagSignature). Returns 0 if the profile
+   cannot be opened or n is out of range. The profile is opened/closed per call;
+   callers loop n in [0, tag_count). */
+uint32_t rcms_oracle_tag_signature(const uint8_t* buf, uint32_t len, uint32_t n) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    uint32_t sig = (uint32_t) cmsGetTagSignature(p, n);
+    cmsCloseProfile(p);
+    return sig;
+}

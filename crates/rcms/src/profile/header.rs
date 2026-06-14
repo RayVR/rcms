@@ -370,6 +370,13 @@ impl Header {
         let mut profile_id = [0u8; 16];
         r.read_exact(&mut profile_id)?;
 
+        // Offsets 100..128: `cmsInt8Number reserved[28]` (lcms2 `cmsICCHeader`).
+        // lcms2 reads the whole 128-byte struct, so its IOhandler is left at 128 —
+        // exactly where the tag directory begins. We must consume these 28 bytes
+        // too, or the directory parse would start 28 bytes early.
+        let mut reserved = [0u8; 28];
+        r.read_exact(&mut reserved)?;
+
         // Version: clamp like lcms2, then reject anything above 0x5000000.
         let version = validate_version(version_raw);
         if version > 0x5000000 {

@@ -28,6 +28,9 @@ unsafe extern "C" {
     fn rcms_oracle_read_alignment(buf: *const u8, len: u32, offset: u32, out_tell: *mut u32)
         -> i32;
     fn rcms_oracle_read_header(buf: *const u8, len: u32, out: *mut OracleHeader) -> i32;
+    fn rcms_oracle_open_succeeds(buf: *const u8, len: u32) -> i32;
+    fn rcms_oracle_tag_count(buf: *const u8, len: u32) -> i32;
+    fn rcms_oracle_tag_signature(buf: *const u8, len: u32, n: u32) -> u32;
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
@@ -65,6 +68,41 @@ pub fn read_header(buf: &[u8]) -> Option<OracleHeader> {
     } else {
         None
     }
+}
+
+/// Full lcms2 `cmsOpenProfileFromMem` over the WHOLE profile bytes (header +
+/// tag directory + duplicate check). `true` if lcms2 accepts the profile. This
+/// is the accept/reject decision `Profile::open` must agree with.
+pub fn open_succeeds(buf: &[u8]) -> bool {
+    // SAFETY: buf/len describe a valid readable slice C only reads (copies into
+    // an in-memory profile, opened and closed entirely inside the call).
+    let ok = unsafe { rcms_oracle_open_succeeds(buf.as_ptr(), buf.len() as u32) };
+    ok != 0
+}
+
+/// lcms2 `cmsGetTagCount` over the accepted directory, or `None` if the profile
+/// cannot be opened.
+pub fn tag_count(buf: &[u8]) -> Option<u32> {
+    // SAFETY: buf/len describe a valid readable slice C only reads.
+    let n = unsafe { rcms_oracle_tag_count(buf.as_ptr(), buf.len() as u32) };
+    if n < 0 {
+        None
+    } else {
+        Some(n as u32)
+    }
+}
+
+/// The accepted tag signatures (`cmsGetTagSignature` looped over the count), or
+/// `None` if the profile cannot be opened.
+pub fn tag_signatures(buf: &[u8]) -> Option<Vec<u32>> {
+    let n = tag_count(buf)?;
+    let mut sigs = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        // SAFETY: buf/len describe a valid readable slice C only reads; i < n.
+        let sig = unsafe { rcms_oracle_tag_signature(buf.as_ptr(), buf.len() as u32, i) };
+        sigs.push(sig);
+    }
+    Some(sigs)
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
