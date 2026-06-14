@@ -7,6 +7,9 @@ unsafe extern "C" {
     fn rcms_oracle_double_to_8fixed8(v: f64) -> u16;
     fn rcms_oracle_to_fixed_domain(a: i32) -> i32;
     fn rcms_oracle_from_fixed_domain(a: i32) -> i32;
+    fn rcms_oracle_quick_floor(v: f64) -> i32;
+    fn rcms_oracle_quick_floor_word(d: f64) -> u16;
+    fn rcms_oracle_quick_saturate_word(d: f64) -> u16;
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
@@ -25,6 +28,22 @@ pub fn to_fixed_domain(a: i32) -> i32 {
 }
 pub fn from_fixed_domain(a: i32) -> i32 {
     unsafe { rcms_oracle_from_fixed_domain(a) }
+}
+
+/// lcms2 `_cmsQuickFloor`.
+pub fn quick_floor(v: f64) -> i32 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_quick_floor(v) }
+}
+/// lcms2 `_cmsQuickFloorWord`.
+pub fn quick_floor_word(d: f64) -> u16 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_quick_floor_word(d) }
+}
+/// lcms2 `_cmsQuickSaturateWord`.
+pub fn quick_saturate_word(d: f64) -> u16 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_quick_saturate_word(d) }
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.

@@ -8,3 +8,8 @@ double   rcms_oracle_s15f16_to_double(int32_t a) { return _cms15Fixed16toDouble(
 uint16_t rcms_oracle_double_to_8fixed8(double v) { return _cmsDoubleTo8Fixed8(v); }
 int32_t  rcms_oracle_to_fixed_domain(int a)       { return _cmsToFixedDomain(a); }
 int32_t  rcms_oracle_from_fixed_domain(int32_t a) { return _cmsFromFixedDomain((cmsS15Fixed16Number)a); }
+
+/* Fast-floor hacks (lcms2_internal.h:160-195). */
+int      rcms_oracle_quick_floor(double v)         { return _cmsQuickFloor(v); }
+uint16_t rcms_oracle_quick_floor_word(double d)    { return _cmsQuickFloorWord(d); }
+uint16_t rcms_oracle_quick_saturate_word(double d) { return _cmsQuickSaturateWord(d); }
