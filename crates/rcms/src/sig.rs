@@ -7,10 +7,18 @@ use core::fmt;
 pub struct Signature(u32);
 
 impl Signature {
-    pub const fn from_bytes(b: [u8; 4]) -> Self { Signature(u32::from_be_bytes(b)) }
-    pub const fn from_raw(v: u32) -> Self { Signature(v) }
-    pub const fn to_raw(self) -> u32 { self.0 }
-    pub const fn to_bytes(self) -> [u8; 4] { self.0.to_be_bytes() }
+    pub const fn from_bytes(b: [u8; 4]) -> Self {
+        Signature(u32::from_be_bytes(b))
+    }
+    pub const fn from_raw(v: u32) -> Self {
+        Signature(v)
+    }
+    pub const fn to_raw(self) -> u32 {
+        self.0
+    }
+    pub const fn to_bytes(self) -> [u8; 4] {
+        self.0.to_be_bytes()
+    }
 
     pub const LAB_DATA: Signature = Signature::from_bytes(*b"Lab ");
     pub const XYZ_DATA: Signature = Signature::from_bytes(*b"XYZ ");
@@ -21,7 +29,15 @@ impl fmt::Display for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in self.to_bytes() {
             let c = byte as char;
-            write!(f, "{}", if c.is_ascii_graphic() || c == ' ' { c } else { '?' })?;
+            write!(
+                f,
+                "{}",
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '?'
+                }
+            )?;
         }
         Ok(())
     }

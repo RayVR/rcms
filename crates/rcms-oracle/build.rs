@@ -8,6 +8,18 @@ fn main() {
     if cfg!(target_endian = "big") {
         panic!("rcms-oracle requires a little-endian host to match lcms2's pinned config");
     }
+    // 32-bit x86 evaluates FP intermediates in 80-bit x87 extended precision
+    // (FLT_EVAL_METHOD != 0), which breaks bit-identity even with -ffp-contract=off.
+    if cfg!(target_arch = "x86") {
+        panic!("rcms-oracle does not support 32-bit x86 (FLT_EVAL_METHOD != 0 on x87)");
+    }
+
+    // Rebuild the static lib whenever the vendored C or the shim changes — without
+    // this, updating the lcms2 submodule would silently reuse a stale .a and the
+    // differential oracle would diff against the wrong reference.
+    println!("cargo:rerun-if-changed=shim.c");
+    println!("cargo:rerun-if-changed=../../vendor/Little-CMS/src");
+    println!("cargo:rerun-if-changed=../../vendor/Little-CMS/include");
 
     let lcms = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/Little-CMS");
     let src = lcms.join("src");
