@@ -14,6 +14,8 @@ use rcms::profile::{Profile, Tag};
 
 const TY_LUT8: u32 = 0x6D66_7431; // 'mft1'
 const TY_LUT16: u32 = 0x6D66_7432; // 'mft2'
+const TY_LUT_A2B: u32 = 0x6D41_4220; // 'mAB '
+const TY_LUT_B2A: u32 = 0x6D42_4120; // 'mBA '
 
 fn testbed_dir() -> PathBuf {
     Path::new(concat!(
@@ -221,4 +223,157 @@ fn lut_types_no_longer_unsupported() {
         checked > 0,
         "expected at least one mft1/mft2 tag in testbed"
     );
+}
+
+/// Differential for the V4 `mAB `/`mBA ` (LutAtoB / LutBtoA) tag readers,
+/// bit-for-bit against lcms2. For every testbed profile carrying such a tag,
+/// read it via rcms `read_tag` -> `Tag::Lut(Pipeline)`, build the SAME pipeline
+/// via lcms2 `cmsReadTag`, and evaluate a bounded input grid through BOTH stacks
+/// in the 16-bit and float domains, asserting bit-exact at every sample.
+#[test]
+fn mab_mba_tag_pipelines_match_oracle_over_testbed() {
+    let files = testbed_icc();
+    assert!(!files.is_empty(), "no .icc in testbed");
+
+    let mut mab_tags = 0usize;
+    let mut mba_tags = 0usize;
+    let mut profiles_with_lut = 0usize;
+    let mut total_samples = 0usize;
+
+    for path in &files {
+        let bytes = fs::read(path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy();
+
+        if !rcms_oracle::open_succeeds(&bytes) {
+            continue;
+        }
+        let p = match Profile::open(&bytes) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let mut hit_here = false;
+        for sig in p.tags().collect::<Vec<_>>() {
+            let raw = sig.to_raw();
+            let ty = match rcms_oracle::tag_true_type(&bytes, raw) {
+                Some(t) => t,
+                None => continue,
+            };
+            if ty != TY_LUT_A2B && ty != TY_LUT_B2A {
+                continue;
+            }
+
+            // rcms: read the tag into a Pipeline.
+            let pipeline = match p.read_tag(sig).expect("rust mab/mba") {
+                Tag::Lut(pl) => pl,
+                other => panic!("{name}:{raw:08x} expected Lut, got {other:?}"),
+            };
+
+            // lcms2: the pipeline channel counts must agree.
+            let (c_in, c_out) =
+                rcms_oracle::lut_channels(&bytes, raw).expect("oracle lut channels");
+            assert_eq!(
+                pipeline.input_channels, c_in as usize,
+                "{name}:{raw:08x} input channels"
+            );
+            assert_eq!(
+                pipeline.output_channels, c_out as usize,
+                "{name}:{raw:08x} output channels"
+            );
+
+            let grid = input_grid_u16(pipeline.input_channels);
+            let n_samples = grid.len();
+            let n_in = pipeline.input_channels;
+            let n_out = pipeline.output_channels;
+            let flat_u16: Vec<u16> = grid.iter().flatten().copied().collect();
+
+            // ---- 16-bit domain ----
+            let oracle16 = rcms_oracle::lut_eval16(&bytes, raw, &flat_u16, n_samples, n_out)
+                .expect("oracle lut eval16");
+            for (s, sample) in grid.iter().enumerate() {
+                let rust = pipeline.eval_16(sample);
+                let c = &oracle16[s * n_out..(s + 1) * n_out];
+                assert_eq!(
+                    rust.as_slice(),
+                    c,
+                    "{name}:{raw:08x} eval16 mismatch at sample {s} in={sample:?}"
+                );
+            }
+
+            // ---- float domain ----
+            let flat_f32: Vec<f32> = flat_u16.iter().map(|&v| v as f32 / 65535.0_f32).collect();
+            let oraclef = rcms_oracle::lut_eval_float(&bytes, raw, &flat_f32, n_samples, n_out)
+                .expect("oracle lut eval float");
+            for s in 0..n_samples {
+                let sample_f: Vec<f32> = flat_f32[s * n_in..(s + 1) * n_in].to_vec();
+                let rust = pipeline.eval_float(&sample_f);
+                let c = &oraclef[s * n_out..(s + 1) * n_out];
+                for (j, (rv, cv)) in rust.iter().zip(c.iter()).enumerate() {
+                    assert_eq!(
+                        rv.to_bits(),
+                        cv.to_bits(),
+                        "{name}:{raw:08x} eval_float mismatch at sample {s} chan {j}: \
+                         rust={rv} lcms2={cv} in={sample_f:?}"
+                    );
+                }
+            }
+
+            total_samples += n_samples;
+            match ty {
+                TY_LUT_A2B => mab_tags += 1,
+                TY_LUT_B2A => mba_tags += 1,
+                _ => unreachable!(),
+            }
+            hit_here = true;
+        }
+        if hit_here {
+            profiles_with_lut += 1;
+        }
+    }
+
+    println!(
+        "testbed mAB/mBA diff: {mab_tags} mAB + {mba_tags} mBA tags over \
+         {profiles_with_lut} profiles; {total_samples} input samples evaluated \
+         (each in both 16-bit and float domains)"
+    );
+    assert!(
+        mab_tags + mba_tags > 0,
+        "expected at least one mAB/mBA tag in the testbed"
+    );
+}
+
+/// Reachability: `mAB `/`mBA ` on-disk types no longer return
+/// `Error::Unsupported` from the type dispatcher (this slice implemented the V4
+/// LUT readers).
+#[test]
+fn mab_mba_types_no_longer_unsupported() {
+    let mut checked = 0usize;
+    for path in testbed_icc() {
+        let bytes = fs::read(&path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy();
+        if !rcms_oracle::open_succeeds(&bytes) {
+            continue;
+        }
+        let p = match Profile::open(&bytes) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        for sig in p.tags().collect::<Vec<_>>() {
+            let raw = sig.to_raw();
+            let ty = match rcms_oracle::tag_true_type(&bytes, raw) {
+                Some(t) => t,
+                None => continue,
+            };
+            if ty != TY_LUT_A2B && ty != TY_LUT_B2A {
+                continue;
+            }
+            let res = p.read_tag(sig);
+            assert!(
+                matches!(res, Ok(Tag::Lut(_))),
+                "{name}:{raw:08x} mAB/mBA tag should decode to Tag::Lut, got {res:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "expected at least one mAB/mBA tag in testbed");
 }

@@ -913,6 +913,8 @@ mod tests {
         0x6266_6420, // 'bfd ' UcrBg
         0x6D66_7431, // 'mft1' Lut8
         0x6D66_7432, // 'mft2' Lut16
+        0x6D41_4220, // 'mAB ' LutAtoB
+        0x6D42_4120, // 'mBA ' LutBtoA
     ];
 
     /// Comprehensive testbed sweep: for every `vendor/Little-CMS/testbed/*.icc`:
