@@ -99,7 +99,11 @@ mod tests {
         let mut rng = rcms_oracle::Rng::new(11);
         for _ in 0..500_000 {
             let m = rand_mat(&mut rng);
-            let v = [rng.next_f64_unit(), rng.next_f64_unit(), rng.next_f64_unit()];
+            let v = [
+                rng.next_f64_unit(),
+                rng.next_f64_unit(),
+                rng.next_f64_unit(),
+            ];
             let r = Mat3(m).eval(Vec3(v));
             let c = rcms_oracle::mat3_eval(&m, &v);
             for i in 0..3 {
@@ -148,7 +152,11 @@ mod tests {
         let mut tested = 0;
         for _ in 0..500_000 {
             let a = rand_mat(&mut rng);
-            let b = [rng.next_f64_unit(), rng.next_f64_unit(), rng.next_f64_unit()];
+            let b = [
+                rng.next_f64_unit(),
+                rng.next_f64_unit(),
+                rng.next_f64_unit(),
+            ];
             match (Mat3(a).solve(Vec3(b)), rcms_oracle::mat3_solve(&a, &b)) {
                 (Some(r), Some(c)) => {
                     for i in 0..3 {
