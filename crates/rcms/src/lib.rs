@@ -10,6 +10,7 @@ pub mod adapt;
 pub mod color;
 pub mod compat;
 pub mod context;
+pub mod curve;
 pub mod error;
 pub mod fixed;
 pub mod io;
@@ -24,6 +25,7 @@ pub use error::{Error, Result};
 pub mod prelude {
     pub use crate::color::{CIELCh, CIELab, CIEXYZTriple, CIExyY, CIExyYTriple, JCh, CIEXYZ};
     pub use crate::context::{Context, Logger};
+    pub use crate::curve::{eval_parametric, CurveSegment, ToneCurve};
     pub use crate::error::{Error, Result};
     pub use crate::fixed::{Half, S15Fixed16, U16Fixed16, U8Fixed8};
     pub use crate::io::{ProfileReader, ProfileWriter};

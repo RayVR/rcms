@@ -6,6 +6,7 @@ unsafe extern "C" {
     fn rcms_oracle_pow(x: f64, y: f64) -> f64;
     fn rcms_oracle_log(x: f64) -> f64;
     fn rcms_oracle_log10(x: f64) -> f64;
+    fn rcms_oracle_eval_parametric(ty: i32, params: *const f64, nparams: i32, x: f32) -> f32;
     fn rcms_oracle_double_to_s15f16(v: f64) -> i32;
     fn rcms_oracle_s15f16_to_double(a: i32) -> f64;
     fn rcms_oracle_double_to_8fixed8(v: f64) -> u16;
@@ -252,6 +253,25 @@ pub fn libm_log(x: f64) -> f64 {
 pub fn libm_log10(x: f64) -> f64 {
     // SAFETY: pure C arithmetic, no pointers, no allocation.
     unsafe { rcms_oracle_log10(x) }
+}
+
+/// lcms2 `cmsBuildParametricToneCurve` + `cmsEvalToneCurveFloat`: builds a
+/// one-segment parametric curve of `ty` with `params` and evaluates it at `x`.
+/// Because the segment spans `(MINUS_INF, PLUS_INF]`, this dispatches straight
+/// to `DefaultEvalParametricFn` for any finite `x` (the only extra processing is
+/// `EvalSegmentedFn`'s infinity clamp to `±1E22` and the final `f32` cast).
+/// Returns `None` when lcms2 rejects the type/params (signalled as NaN by the
+/// shim), so callers skip those param sets.
+pub fn eval_parametric(ty: i32, params: &[f64], x: f32) -> Option<f32> {
+    // SAFETY: `params` is a valid readable slice of `params.len()` f64s; C reads
+    // exactly `ParameterCount[ty]` of them (the test always supplies at least
+    // that many). The curve handle is built and freed entirely inside the call.
+    let y = unsafe { rcms_oracle_eval_parametric(ty, params.as_ptr(), params.len() as i32, x) };
+    if y.is_nan() {
+        None
+    } else {
+        Some(y)
+    }
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.

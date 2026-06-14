@@ -12,6 +12,25 @@ double rcms_oracle_pow(double x, double y) { return pow(x, y); }
 double rcms_oracle_log(double x)           { return log(x); }
 double rcms_oracle_log10(double x)         { return log10(x); }
 
+/* ---- Parametric tone-curve evaluator (cmsgamma.c DefaultEvalParametricFn) ----
+   Builds a one-segment parametric curve of the given type and evaluates it via
+   cmsEvalToneCurveFloat at x. For a curve built by cmsBuildParametricToneCurve
+   the single function segment spans (MINUS_INF, PLUS_INF], so any finite x is
+   in-domain and EvalSegmentedFn dispatches straight to DefaultEvalParametricFn
+   (no table interpolation; nSegments==1 so the 16-bit-table branch of
+   cmsEvalToneCurveFloat is skipped). EvalSegmentedFn additionally clamps an
+   infinite result to +/-1E22F before the cmsFloat32Number cast. Returns the
+   evaluator output as a float, or NAN if lcms2 rejects the type/params (so the
+   Rust side can skip those param sets). */
+float rcms_oracle_eval_parametric(int type, const double* params, int nparams, float x) {
+    (void) nparams; /* lcms2 reads exactly ParameterCount[type] params itself. */
+    cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, type, params);
+    if (!c) return NAN;
+    float y = cmsEvalToneCurveFloat(c, x);
+    cmsFreeToneCurve(c);
+    return y;
+}
+
 /* Fixed-point (cmsplugin.c:383). */
 int32_t rcms_oracle_double_to_s15f16(double v) { return (int32_t) _cmsDoubleTo15Fixed16(v); }
 
