@@ -2,3 +2,5 @@
 
 pub mod half;
 pub mod matrix;
+pub mod md5;
+pub mod whitepoint;

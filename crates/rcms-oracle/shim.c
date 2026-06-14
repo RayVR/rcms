@@ -42,3 +42,13 @@ int rcms_oracle_mat3_solve(double out[3], const double a[9], const double b[3]) 
 /* IEEE half<->float (cmshalf.c, table-based van der Zijp method). */
 float    rcms_oracle_half_to_float(uint16_t h) { return _cmsHalf2Float(h); }
 uint16_t rcms_oracle_float_to_half(float f)    { return _cmsFloat2Half(f); }
+
+/* RFC 1321 MD5 (cmsmd5.c, public API via lcms2_plugin.h, already included by
+   lcms2_internal.h above — adding #include "lcms2.h" would redefine symbols). */
+void rcms_oracle_md5(uint8_t out[16], const uint8_t* buf, uint32_t len) {
+    cmsHANDLE h = cmsMD5alloc(NULL);
+    if (!h) { for (int i=0;i<16;i++) out[i] = 0; return; }
+    cmsMD5add(h, buf, len);
+    cmsProfileID id; cmsMD5finish(&id, h);
+    for (int i=0;i<16;i++) out[i] = id.ID8[i];
+}

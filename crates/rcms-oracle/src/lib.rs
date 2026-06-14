@@ -16,6 +16,7 @@ unsafe extern "C" {
     fn rcms_oracle_mat3_solve(out: *mut f64, a: *const f64, b: *const f64) -> i32;
     fn rcms_oracle_half_to_float(h: u16) -> f32;
     fn rcms_oracle_float_to_half(f: f32) -> u16;
+    fn rcms_oracle_md5(out: *mut u8, buf: *const u8, len: u32);
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
@@ -106,6 +107,16 @@ pub fn half_to_float(h: u16) -> f32 {
 pub fn float_to_half(f: f32) -> u16 {
     // SAFETY: pure C arithmetic, no pointers, no allocation.
     unsafe { rcms_oracle_float_to_half(f) }
+}
+
+/// lcms2 `cmsMD5alloc`/`cmsMD5add`/`cmsMD5finish` (RFC 1321 MD5 over `buf`).
+pub fn md5(buf: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    // SAFETY: out is a valid 16-byte array; buf/len describe a valid slice; C only reads buf and writes 16 bytes to out.
+    unsafe {
+        rcms_oracle_md5(out.as_mut_ptr(), buf.as_ptr(), buf.len() as u32);
+    }
+    out
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.
