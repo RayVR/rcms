@@ -7,6 +7,30 @@
 //! `FloatXFORM` per-pixel evaluation; [`Transform::do_transform_16`] is the 16-bit
 //! `PrecalculatedXFORM`/`CachedXFORM` path. Pixel-format packing/unpacking is
 //! deferred to slice 6, so the buffers here are flat float/u16 arrays.
+//!
+//! # What slice 5 defers (the differential boundary)
+//!
+//! The transform/link path is bit-exact against lcms2 (NOOPTIMIZE) over the
+//! testbed sweep, except for three explicitly-deferred areas. A future reader
+//! should not mistake these for missing features; they are scoped out of slice 5:
+//!
+//! 1. **Black-point detection-by-sampling.** The BPC matrix math
+//!    ([`compute_black_point_compensation`](crate::link::compute_black_point_compensation))
+//!    and the V4-perceptual-black *constant* path are implemented and exact. Every
+//!    black-point that lcms2 resolves by *sampling* the profile is deferred and
+//!    surfaces as [`Error::Unsupported`]: V4 matrix-shaper under
+//!    perceptual/saturation (`BlackPointAsDarkerColorant`), V2 BPC, ink-output
+//!    relative-colorimetric (`BlackPointUsingPerceptualBlack`), the
+//!    media-black-point-tag path, and the destination round-trip detection. These
+//!    need slice-7 Lab virtual profiles + round-trip transforms.
+//!    (See [`crate::link::black_point`].)
+//! 2. **Fractional adaptation state `0 < s < 1`.** Only the fully-adapted
+//!    (`s = 1`) and unadapted (`s = 0`) endpoints are handled in
+//!    `ComputeAbsoluteIntent`. The interpolated state needs `cmsTempFromWhitePoint`
+//!    (blackbody-temperature estimation), deferred.
+//! 3. **Pixel-format packing + pipeline optimization.** Buffers are flat
+//!    float/u16 arrays; the `cmsFormatter` packing/unpacking layer and the
+//!    optimizer (`cmsFLAGS_NOOPTIMIZE` is forced on) are slice 6.
 
 use crate::color::CIEXYZ;
 use crate::link::{default_icc_intents, link_bpc_mutation};
