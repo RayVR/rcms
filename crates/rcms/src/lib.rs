@@ -18,6 +18,7 @@ pub mod interp;
 pub mod io;
 pub mod link;
 pub mod math;
+pub mod opt;
 pub mod pcs;
 pub mod pipeline;
 pub mod profile;

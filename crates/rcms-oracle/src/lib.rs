@@ -441,8 +441,144 @@ unsafe extern "C" {
         n_pixels: u32,
     ) -> i32;
 
+    // Format-aware do_transform with lcms2's DEFAULT optimizer (no NOOPTIMIZE):
+    // exercises OptimizeMatrixShaper (MatShaperEval16) for RGB matrix-shaper
+    // transforms with an 8-bit input format.
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_transform_eval_default_8(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_transform_eval_default_16(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
     fn rcms_oracle_from_8_to_16(v: u8) -> u16;
     fn rcms_oracle_from_16_to_8(v: u16) -> u8;
+}
+
+/// Like [`do_transform_packed`] but with lcms2's **DEFAULT** optimizer enabled
+/// (no `cmsFLAGS_NOOPTIMIZE`). For an RGB→RGB matrix-shaper transform with an
+/// 8-bit input format this drives lcms2's `OptimizeMatrixShaper` /
+/// `MatShaperEval16` 1.14-fixed evaluator — the reference for rcms's
+/// `Lcms2Compat` matrix-shaper optimizer. `default_8` and `default_16` differ
+/// only in the formats the caller passes (8-bit vs 16-bit output); both still
+/// require an 8-bit *input* format for the matrix-shaper path to fire in lcms2.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed_default_8(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    do_transform_packed_default_impl(
+        profiles, intents, bpc, adaptation, in_fmt, out_fmt, input, output, n_pixels, false,
+    )
+}
+
+/// 16-bit-output sibling of [`do_transform_packed_default_8`]; see its docs.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed_default_16(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    do_transform_packed_default_impl(
+        profiles, intents, bpc, adaptation, in_fmt, out_fmt, input, output, n_pixels, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_transform_packed_default_impl(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+    use_16: bool,
+) -> bool {
+    let n = profiles.len();
+    assert_eq!(intents.len(), n);
+    assert_eq!(bpc.len(), n);
+    assert_eq!(adaptation.len(), n);
+
+    let bufs: Vec<*const u8> = profiles.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<u32> = profiles.iter().map(|p| p.len() as u32).collect();
+    let bpc_i: Vec<i32> = bpc.iter().map(|&b| b as i32).collect();
+
+    // SAFETY: identical contract to `do_transform_packed` — `bufs`/`lens`
+    // describe `n` readable profile slices; `intents`/`bpc_i`/`adaptation` are
+    // `n`-element readable arrays; C reads `n_pixels` packed pixels of `in_fmt`
+    // from `input` and writes `n_pixels` packed pixels of `out_fmt` into
+    // `output` (the caller sizes both). The only difference is the transform is
+    // built with the DEFAULT optimizer (dwFlags == 0).
+    let ok = unsafe {
+        if use_16 {
+            rcms_oracle_transform_eval_default_16(
+                bufs.as_ptr(),
+                lens.as_ptr(),
+                n as u32,
+                intents.as_ptr(),
+                bpc_i.as_ptr(),
+                adaptation.as_ptr(),
+                in_fmt,
+                out_fmt,
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                n_pixels as u32,
+            )
+        } else {
+            rcms_oracle_transform_eval_default_8(
+                bufs.as_ptr(),
+                lens.as_ptr(),
+                n as u32,
+                intents.as_ptr(),
+                bpc_i.as_ptr(),
+                adaptation.as_ptr(),
+                in_fmt,
+                out_fmt,
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                n_pixels as u32,
+            )
+        }
+    };
+    ok != 0
 }
 
 /// lcms2 `FROM_8_TO_16` (lcms2_internal.h:125).

@@ -28,9 +28,14 @@
 //!    (`s = 1`) and unadapted (`s = 0`) endpoints are handled in
 //!    `ComputeAbsoluteIntent`. The interpolated state needs `cmsTempFromWhitePoint`
 //!    (blackbody-temperature estimation), deferred.
-//! 3. **Pixel-format packing + pipeline optimization.** Buffers are flat
-//!    float/u16 arrays; the `cmsFormatter` packing/unpacking layer and the
-//!    optimizer (`cmsFLAGS_NOOPTIMIZE` is forced on) are slice 6.
+//! 3. **Pixel-format packing + pipeline optimization.** The flat float/u16
+//!    constructors keep the slice-5 behavior. The format-aware constructors add
+//!    the `cmsFormatter` packing/unpacking layer (slice 6) and a swappable
+//!    [`OptimizationStrategy`](crate::opt::OptimizationStrategy): the DEFAULT
+//!    `Accurate` is the unchanged in-place eval (bit-identical to lcms2
+//!    `NOOPTIMIZE`); opt-in `Lcms2Compat` applies lcms2's matrix-shaper optimizer
+//!    (`MatShaperEval16`) to match lcms2-default. The lossy resampling bake is a
+//!    later task.
 
 use crate::color::CIEXYZ;
 use crate::format::{
@@ -39,6 +44,7 @@ use crate::format::{
 };
 use crate::link::{default_icc_intents, link_bpc_mutation};
 use crate::math::whitepoint::D50;
+use crate::opt::{OptimizationStrategy, OptimizedEval};
 use crate::pipeline::Pipeline;
 use crate::profile::{ColorSpace, Profile, ProfileClass, RenderingIntent};
 use crate::{Error, Result};
@@ -118,6 +124,12 @@ pub struct Transform {
     gamut_check: Option<Pipeline>,
     // Packing layer (None for the flat-buffer constructors that bypass formatters).
     formatters: Option<Formatters>,
+    // The pipeline-optimization strategy (swappable; default Accurate).
+    strategy: OptimizationStrategy,
+    // The optimized eval the do_transform loop calls, built from `strategy` once
+    // the formats are known. `Pipeline` (the accurate in-place eval) until a
+    // format-aware constructor with a firing optimizer rebuilds it.
+    opt_eval: OptimizedEval,
 }
 
 /// lcms2 `NormalizeXYZ` (`cmsxform.c:1090-1101`): some profiles store the media
@@ -280,6 +292,8 @@ impl Transform {
             rendering_intent: last_intent,
             gamut_check: None,
             formatters: None,
+            strategy: OptimizationStrategy::Accurate,
+            opt_eval: OptimizedEval::Pipeline,
         })
     }
 
@@ -302,8 +316,40 @@ impl Transform {
         in_fmt: u32,
         out_fmt: u32,
     ) -> Result<Transform> {
+        Transform::new_with_formats_strategy(
+            profiles,
+            intents,
+            bpc,
+            adaptation,
+            flags,
+            in_fmt,
+            out_fmt,
+            OptimizationStrategy::Accurate,
+        )
+    }
+
+    /// Like [`Transform::new_with_formats`] but choosing the pipeline
+    /// [`OptimizationStrategy`] explicitly. With
+    /// [`OptimizationStrategy::Lcms2Compat`] the matrix-shaper optimizer is built
+    /// against the in/out formats (firing only for the RGB 8-bit-input
+    /// matrix-shaper pattern; otherwise it falls back to the accurate in-place
+    /// eval). [`Accurate`](OptimizationStrategy::Accurate) always evaluates the
+    /// pipeline in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_formats_strategy(
+        profiles: &[&Profile],
+        intents: &[RenderingIntent],
+        bpc: &[bool],
+        adaptation: &[f64],
+        flags: Flags,
+        in_fmt: u32,
+        out_fmt: u32,
+        strategy: OptimizationStrategy,
+    ) -> Result<Transform> {
         let mut xform = Transform::new(profiles, intents, bpc, adaptation, flags)?;
         xform.formatters = Some(select_formatters(in_fmt, out_fmt)?);
+        xform.strategy = strategy;
+        xform.opt_eval = strategy.build(&xform.lut, in_fmt, out_fmt);
         Ok(xform)
     }
 
@@ -326,6 +372,48 @@ impl Transform {
             in_fmt,
             out_fmt,
         )
+    }
+
+    /// Convenience 2-profile format-aware constructor choosing the
+    /// [`OptimizationStrategy`] (lcms2 `cmsCreateTransform` with explicit format
+    /// words and a chosen optimizer). Default adaptation 1.0, BPC `bpc`.
+    ///
+    /// With [`OptimizationStrategy::Lcms2Compat`] the build flags drop
+    /// `NOOPTIMIZE` (so the recorded pipeline still matches lcms2's
+    /// pre-optimization device link, and the matrix-shaper optimizer is applied
+    /// on top); with [`Accurate`](OptimizationStrategy::Accurate) `NOOPTIMIZE` is
+    /// forced as usual.
+    pub fn new_simple_with_formats_strategy(
+        input: &Profile,
+        output: &Profile,
+        intent: RenderingIntent,
+        bpc: bool,
+        in_fmt: u32,
+        out_fmt: u32,
+        strategy: OptimizationStrategy,
+    ) -> Result<Transform> {
+        Transform::new_with_formats_strategy(
+            &[input, output],
+            &[intent, intent],
+            &[bpc, bpc],
+            &[1.0, 1.0],
+            Flags::NOOPTIMIZE,
+            in_fmt,
+            out_fmt,
+            strategy,
+        )
+    }
+
+    /// The pipeline-optimization strategy this transform was built with.
+    pub fn strategy(&self) -> OptimizationStrategy {
+        self.strategy
+    }
+
+    /// Whether the matrix-shaper optimizer actually fired for this transform
+    /// (true only under [`OptimizationStrategy::Lcms2Compat`] when the RGB 8-bit
+    /// matrix-shaper pattern matched).
+    pub fn matshaper_fired(&self) -> bool {
+        matches!(self.opt_eval, OptimizedEval::MatShaper(_))
     }
 
     /// Convenience 2-profile constructor (lcms2 `cmsCreateTransform`, which routes
@@ -480,9 +568,20 @@ impl Transform {
                 let acc = &input[i * in_stride..];
                 let out = &mut output[i * out_stride..];
                 from_input(acc, &mut win);
-                let res = self.lut.eval_16(&win[..in_ch]);
                 let mut wout = [0u16; MAX_CHANNELS];
-                wout[..out_ch].copy_from_slice(&res);
+                match &self.opt_eval {
+                    // lcms2 `MatShaperEval16`: the 1.14-fixed RGB matrix-shaper
+                    // evaluator (Lcms2Compat). Replaces the float pipeline eval.
+                    OptimizedEval::MatShaper(data) => {
+                        let res = data.eval(&[win[0], win[1], win[2]]);
+                        wout[..3].copy_from_slice(&res);
+                    }
+                    // The accurate in-place pipeline eval.
+                    OptimizedEval::Pipeline => {
+                        let res = self.lut.eval_16(&win[..in_ch]);
+                        wout[..out_ch].copy_from_slice(&res);
+                    }
+                }
                 to_output(&wout, out);
             }
         }
