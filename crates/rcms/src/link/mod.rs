@@ -5,6 +5,10 @@
 //! PCS→device, and device-link LUT extraction that
 //! `_cmsReadInputLUT`/`_cmsReadOutputLUT`/`_cmsReadDevicelinkLUT` perform.
 
+pub mod intents;
 pub mod profile_lut;
 
+pub use intents::{
+    add_conversion, compute_conversion, default_icc_intents, is_empty_layer, link_bpc_mutation,
+};
 pub use profile_lut::{read_devicelink_lut, read_input_lut, read_output_lut};

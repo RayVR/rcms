@@ -388,6 +388,20 @@ unsafe extern "C" {
         nx: u32,
         ys: *mut f32,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_transform_eval_float(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        input: *const f32,
+        in_chans: u32,
+        out: *mut f32,
+        out_chans: u32,
+        n_pixels: u32,
+    ) -> i32;
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
@@ -2323,6 +2337,65 @@ pub fn reverse_tabulated16_eval_float(table: &[u16], xs: &[f32]) -> Option<Vec<f
     };
     if ok != 0 {
         Some(ys)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsCreateExtendedTransform` (NOOPTIMIZE) over `profiles` (each a raw
+/// profile byte block) with the per-link `intents`, `bpc`, and `adaptation`
+/// arrays, then `cmsDoTransform` over `n_pixels` float pixels. The input/output
+/// formats are generic float (PT_ANY, identity FloatXFORM packing), so this is
+/// the bit-exact reference for an rcms transform built from the same chain.
+/// `in_chans`/`out_chans` are the first/last device channel counts; `input` is
+/// `n_pixels * in_chans` f32 row-major. Returns the `n_pixels * out_chans` f32
+/// outputs, or `None` if any profile fails to open or the transform cannot be
+/// created.
+#[allow(clippy::too_many_arguments)]
+pub fn transform_eval_float(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    input: &[f32],
+    in_chans: usize,
+    out_chans: usize,
+    n_pixels: usize,
+) -> Option<Vec<f32>> {
+    let n = profiles.len();
+    assert_eq!(intents.len(), n);
+    assert_eq!(bpc.len(), n);
+    assert_eq!(adaptation.len(), n);
+    assert_eq!(input.len(), n_pixels * in_chans);
+
+    let bufs: Vec<*const u8> = profiles.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<u32> = profiles.iter().map(|p| p.len() as u32).collect();
+    let bpc_i: Vec<i32> = bpc.iter().map(|&b| b as i32).collect();
+    let mut out = vec![0f32; n_pixels * out_chans];
+
+    // SAFETY: `bufs`/`lens` describe `n` valid readable profile slices C only
+    // reads (each copied into an in-memory profile, opened and closed inside the
+    // call). `intents`/`bpc_i`/`adaptation` are `n`-element readable arrays. C
+    // reads `n_pixels * in_chans` f32 from `input` and writes exactly
+    // `n_pixels * out_chans` f32 into `out`. The transform and all profiles are
+    // freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_transform_eval_float(
+            bufs.as_ptr(),
+            lens.as_ptr(),
+            n as u32,
+            intents.as_ptr(),
+            bpc_i.as_ptr(),
+            adaptation.as_ptr(),
+            input.as_ptr(),
+            in_chans as u32,
+            out.as_mut_ptr(),
+            out_chans as u32,
+            n_pixels as u32,
+        )
+    };
+    if ok != 0 {
+        Some(out)
     } else {
         None
     }

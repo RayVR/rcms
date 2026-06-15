@@ -1450,3 +1450,58 @@ int rcms_oracle_reverse_tabulated16_eval_float(const uint16_t* table, uint32_t n
     cmsFreeToneCurve(c);
     return 1;
 }
+
+/* ---- Multiprofile transform (cmsxform.c / cmscnvrt.c) ----------------------
+   Build an N-profile transform via cmsCreateExtendedTransform with EXPLICIT
+   intents, BPC, and adaptation-state arrays, forcing cmsFLAGS_NOOPTIMIZE so the
+   un-optimized device-link pipeline runs (the slice-5 differential reference).
+   Input/output formats are generic float (FLOAT_SH(1)|PT_ANY|CHANNELS_SH(n)|
+   BYTES_SH(4)) so packing/unpacking is the identity FloatXFORM path. Each
+   profile is opened from its own memory block (bufs[i], lens[i]); `inChans`/
+   `outChans` are the first/last device channel counts; `in`/`out` carry
+   nPixels*inChans / nPixels*outChans floats row-major. Returns 1 on success,
+   0 if any profile fails to open or the transform cannot be created. */
+static uint32_t float_format(uint32_t nChans) {
+    return FLOAT_SH(1) | COLORSPACE_SH(PT_ANY) | CHANNELS_SH(nChans) | BYTES_SH(4);
+}
+
+int rcms_oracle_transform_eval_float(const uint8_t* const* bufs, const uint32_t* lens,
+                                     uint32_t n, const uint32_t* intents,
+                                     const int32_t* bpc, const double* adaptation,
+                                     const float* in, uint32_t inChans,
+                                     float* out, uint32_t outChans, uint32_t nPixels) {
+    if (n == 0 || n > 255) return 0;
+    cmsHPROFILE* profiles = (cmsHPROFILE*) calloc(n, sizeof(cmsHPROFILE));
+    cmsBool*     bpcArr    = (cmsBool*)    calloc(n, sizeof(cmsBool));
+    cmsUInt32Number* intArr = (cmsUInt32Number*) calloc(n, sizeof(cmsUInt32Number));
+    cmsFloat64Number* adArr = (cmsFloat64Number*) calloc(n, sizeof(cmsFloat64Number));
+    if (!profiles || !bpcArr || !intArr || !adArr) {
+        free(profiles); free(bpcArr); free(intArr); free(adArr);
+        return 0;
+    }
+    int ok = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        profiles[i] = cmsOpenProfileFromMem((const void*) bufs[i], lens[i]);
+        if (!profiles[i]) ok = 0;
+        bpcArr[i] = bpc[i] ? TRUE : FALSE;
+        intArr[i] = intents[i];
+        adArr[i]  = adaptation[i];
+    }
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateExtendedTransform(
+            NULL, n, profiles, bpcArr, intArr, adArr,
+            NULL, 0, float_format(inChans), float_format(outChans),
+            cmsFLAGS_NOOPTIMIZE);
+    }
+    if (xform) {
+        cmsDoTransform(xform, in, out, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    for (uint32_t i = 0; i < n; i++) if (profiles[i]) cmsCloseProfile(profiles[i]);
+    free(profiles); free(bpcArr); free(intArr); free(adArr);
+    return ok;
+}
