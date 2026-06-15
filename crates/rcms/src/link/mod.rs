@@ -9,6 +9,7 @@ pub mod intents;
 pub mod profile_lut;
 
 pub use intents::{
-    add_conversion, compute_conversion, default_icc_intents, is_empty_layer, link_bpc_mutation,
+    add_conversion, compute_absolute_intent, compute_conversion, default_icc_intents,
+    is_empty_layer, link_bpc_mutation, read_chad, read_media_white_point,
 };
 pub use profile_lut::{read_devicelink_lut, read_input_lut, read_output_lut};

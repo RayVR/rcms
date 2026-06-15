@@ -16,11 +16,14 @@
 //! black-point-compensation branch (`ComputeBlackPointCompensation`, T5) are
 //! left as TODO hooks.
 
+use crate::color::CIEXYZ;
 use crate::error::{Error, Result};
 use crate::link::profile_lut::{read_devicelink_lut, read_input_lut, read_output_lut};
 use crate::math::matrix::{Mat3, Vec3};
+use crate::math::whitepoint::D50;
 use crate::pipeline::{Pipeline, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass, RenderingIntent};
+use crate::sig::Signature;
 
 /// `MAX_ENCODEABLE_XYZ` (lcms2_internal.h:71): `1.0 + 32767.0/32768.0`. The
 /// `ComputeConversion` offset divisor (cmscnvrt.c:412).
@@ -30,9 +33,172 @@ const MAX_ENCODEABLE_XYZ: f64 = 1.0 + 32767.0 / 32768.0;
 /// already holds the validated/clamped encoded value (`cmsGetEncodedICCversion`).
 const ICC_VERSION_V4: u32 = 0x0400_0000;
 
+/// `cmsSigMediaWhitePointTag` (`'wtpt'`, include/lcms2.h:394).
+const SIG_MEDIA_WHITE_POINT: Signature = Signature::from_raw(0x7774_7074);
+/// `cmsSigChromaticAdaptationTag` (`'chad'`, include/lcms2.h:365).
+const SIG_CHROMATIC_ADAPTATION: Signature = Signature::from_raw(0x6368_6164);
+
 /// The 3x3 identity matrix (`_cmsMAT3identity`, cmsmtrx.c).
 fn mat3_identity() -> Mat3 {
     Mat3([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+}
+
+/// lcms2 `_cmsReadMediaWhitePoint` (`cmsio1.c:64-90`): read the `mediaWhitePoint`
+/// (`wtpt`) tag. Fallbacks, verbatim:
+/// - if the tag is absent → D50;
+/// - else if the profile is **V2** (`encoded version < 0x4000000`) AND a
+///   **display** class profile → D50 (a V2 display profile's wtpt is, per spec,
+///   always D50 in the PCS);
+/// - else → the tag value as-is.
+pub fn read_media_white_point(profile: &Profile) -> Result<CIEXYZ> {
+    let tag = match profile.read_tag(SIG_MEDIA_WHITE_POINT) {
+        Ok(crate::profile::Tag::Xyz(xyz)) => Some(xyz),
+        // Tag absent (or present but not an XYZ value, which lcms2's typed read
+        // would also reject → treated as "no wp").
+        _ => None,
+    };
+
+    // If no wp, take D50.
+    let tag = match tag {
+        Some(t) => t,
+        None => return Ok(D50),
+    };
+
+    // V2 display profiles should give D50.
+    if profile.header().version < ICC_VERSION_V4
+        && profile.header().device_class == ProfileClass::Display
+    {
+        return Ok(D50);
+    }
+
+    Ok(tag)
+}
+
+/// lcms2 `_cmsReadCHAD` (`cmsio1.c:94-128`): read the `chromaticAdaptation`
+/// (`chad`) tag as a row-major [`Mat3`] (9 s15Fixed16 → f64). Fallbacks, verbatim:
+/// - if the tag is present → that matrix;
+/// - else default to identity, then: if the profile is **V2** AND a **display**
+///   class profile, replace identity with the Bradford adaptation matrix from the
+///   media white point to D50 (or keep identity if there is no wtpt tag).
+pub fn read_chad(profile: &Profile) -> Result<Mat3> {
+    if let Ok(crate::profile::Tag::S15Fixed16Array(v)) = profile.read_tag(SIG_CHROMATIC_ADAPTATION)
+    {
+        if v.len() == 9 {
+            let mut m = [0.0f64; 9];
+            for (i, s) in v.iter().enumerate() {
+                m[i] = s.to_f64();
+            }
+            return Ok(Mat3(m));
+        }
+        // A chad tag with the wrong arity is malformed; fall through to the
+        // identity/display default (lcms2 only ever stores 9-element chads).
+    }
+
+    // No CHAD available, default it to identity.
+    let mut dest = mat3_identity();
+
+    // V2 display profiles should give D50.
+    if profile.header().version < ICC_VERSION_V4
+        && profile.header().device_class == ProfileClass::Display
+    {
+        let white = match profile.read_tag(SIG_MEDIA_WHITE_POINT) {
+            Ok(crate::profile::Tag::Xyz(xyz)) => Some(xyz),
+            _ => None,
+        };
+        match white {
+            // No wtpt → stay identity.
+            None => return Ok(dest),
+            // Bradford adaptation from the media white point to D50.
+            Some(w) => {
+                dest = crate::adapt::adaptation_matrix(None, w, D50)
+                    .ok_or(Error::Corrupt("singular CHAD adaptation matrix"))?;
+            }
+        }
+    }
+
+    Ok(dest)
+}
+
+/// lcms2 `ComputeAbsoluteIntent` (`cmscnvrt.c:250-325`): join the relative→absolute
+/// and absolute→relative scalings into a single 3x3 chromatic-adaptation matrix
+/// between the input and output media white points.
+///
+/// **AdaptationState semantics (transcribed verbatim):**
+/// - `== 1.0` (the default / fully-adapted observer, standard V4 behaviour): a
+///   pure **diagonal** matrix of `WPin/WPout` per-axis ratios. The CHADs are *not*
+///   used in this branch.
+/// - `== 0.0` (observer not adapted, undo the chromatic adaptation): uses only the
+///   CHAD matrices + the diagonal scale; no temperature involved.
+/// - `0.0 < state < 1.0` (incomplete adaptation): needs `CHAD2Temp`/`Temp2CHAD`
+///   (correlated-colour-temperature round-trip), which depend on
+///   `cmsTempFromWhitePoint` — **not yet ported** to rcms. This sub-case returns
+///   [`Error::Unsupported`]. The two endpoint states (1.0 and 0.0) are fully
+///   implemented and tested; the default state is 1.0.
+pub fn compute_absolute_intent(
+    adaptation_state: f64,
+    white_point_in: &CIEXYZ,
+    chad_in: &Mat3,
+    white_point_out: &CIEXYZ,
+    chad_out: &Mat3,
+) -> Result<Mat3> {
+    // Adaptation state.
+    if adaptation_state == 1.0 {
+        // Observer is fully adapted. Keep chromatic adaptation.
+        // That is the standard V4 behaviour.
+        return Ok(Mat3([
+            white_point_in.x / white_point_out.x,
+            0.0,
+            0.0,
+            0.0,
+            white_point_in.y / white_point_out.y,
+            0.0,
+            0.0,
+            0.0,
+            white_point_in.z / white_point_out.z,
+        ]));
+    }
+
+    // Incomplete adaptation. This is an advanced feature.
+    let scale = Mat3([
+        white_point_in.x / white_point_out.x,
+        0.0,
+        0.0,
+        0.0,
+        white_point_in.y / white_point_out.y,
+        0.0,
+        0.0,
+        0.0,
+        white_point_in.z / white_point_out.z,
+    ]);
+
+    if adaptation_state == 0.0 {
+        // m1 = *ChromaticAdaptationMatrixOut;
+        // _cmsMAT3per(&m2, &m1, &Scale);
+        // m2 holds CHAD from output white to D50 times abs. col. scaling.
+        let m2 = chad_out.per(&scale);
+
+        // Observer is not adapted, undo the chromatic adaptation.
+        // _cmsMAT3per(m, &m2, ChromaticAdaptationMatrixOut);
+        // NOTE: the C overwrites `m` here, then immediately overwrites it again
+        // below with `_cmsMAT3per(m, &m2, &m4)`; only the second assignment
+        // survives, so the first is dead. We transcribe only the surviving op.
+        //
+        // m3 = *ChromaticAdaptationMatrixIn;
+        // if (!_cmsMAT3inverse(&m3, &m4)) return FALSE;
+        // _cmsMAT3per(m, &m2, &m4);
+        let m4 = chad_in
+            .inverse()
+            .ok_or(Error::Corrupt("singular input CHAD"))?;
+        Ok(m2.per(&m4))
+    } else {
+        // 0 < AdaptationState < 1: the CHAD2Temp/Temp2CHAD mixed-temperature path
+        // (cmscnvrt.c:293-320) needs cmsTempFromWhitePoint, which is not yet
+        // ported. The default/tested adaptation state is 1.0; 0.0 is also
+        // supported above. Fractional adaptation is deferred.
+        Err(Error::Unsupported(
+            "fractional absolute-colorimetric adaptation (CHAD2Temp/Temp2CHAD) not implemented",
+        ))
+    }
 }
 
 /// lcms2 `_cmsLinkProfiles` BPC-array mutation (`cmscnvrt.c:1119-1135`), which
@@ -91,25 +257,33 @@ pub fn is_empty_layer(m: &Mat3, off: &Vec3) -> bool {
 /// `MAX_ENCODEABLE_XYZ` at the end (a no-op for the zero offset here, but the same
 /// code path); we replicate that.
 pub fn compute_conversion(
-    _i: usize,
-    _profiles: &[&Profile],
+    i: usize,
+    profiles: &[&Profile],
     intent: RenderingIntent,
     bpc: bool,
-    _adaptation_state: f64,
+    adaptation_state: f64,
 ) -> Result<(Mat3, Vec3)> {
     // m and off are set to identity and this is detected later on (cmscnvrt.c:364).
-    let m = mat3_identity();
+    let mut m = mat3_identity();
     let mut off = Vec3([0.0, 0.0, 0.0]);
 
     if intent == RenderingIntent::AbsoluteColorimetric {
-        // TODO(T3): absolute colorimetric → ComputeAbsoluteIntent
-        // (cmscnvrt.c:368-383, ComputeAbsoluteIntent :250-325). Reads media white
-        // points + CHAD from profiles[i-1]/profiles[i] and builds the
-        // chromatic-adaptation matrix. Not yet implemented; only the no-abs path
-        // is exercised by T2.
-        return Err(Error::Unsupported(
-            "absolute-colorimetric conversion not implemented (T3)",
-        ));
+        // Absolute colorimetric (cmscnvrt.c:368-383): read media white points +
+        // CHADs of profiles[i-1] (current PCS) and profiles[i], then build the
+        // chromatic-adaptation matrix. The offset stays zero.
+        let white_point_in = read_media_white_point(profiles[i - 1])?;
+        let chad_in = read_chad(profiles[i - 1])?;
+
+        let white_point_out = read_media_white_point(profiles[i])?;
+        let chad_out = read_chad(profiles[i])?;
+
+        m = compute_absolute_intent(
+            adaptation_state,
+            &white_point_in,
+            &chad_in,
+            &white_point_out,
+            &chad_out,
+        )?;
     } else if bpc {
         // TODO(T5): black-point compensation → cmsDetectBlackPoint /
         // cmsDetectDestinationBlackPoint + ComputeBlackPointCompensation
@@ -602,6 +776,172 @@ mod tests {
     }
 
     // ---- compute_conversion (relative path) ---------------------------------
+
+    // ---- read_media_white_point / read_chad ---------------------------------
+
+    fn load(name: &str) -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/../../vendor/Little-CMS/testbed/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn read_media_white_point_v2_display_is_d50() {
+        // test5 is a V2 RGB display profile → media white point forced to D50.
+        let bytes = load("test5.icc");
+        let p = Profile::open(&bytes).unwrap();
+        assert!(p.header().version < ICC_VERSION_V4);
+        assert_eq!(p.header().device_class, ProfileClass::Display);
+        let wp = read_media_white_point(&p).unwrap();
+        assert_eq!(wp, D50);
+    }
+
+    #[test]
+    fn read_chad_falls_back_when_absent() {
+        // Whatever the profile, read_chad must succeed (identity, Bradford, or a
+        // real chad tag) and never error for a valid testbed profile.
+        for name in ["test5.icc", "crayons.icc"] {
+            let bytes = load(name);
+            let p = Profile::open(&bytes).unwrap();
+            let chad = read_chad(&p).unwrap();
+            // The matrix must be non-singular (invertible) — both identity and a
+            // real adaptation matrix are.
+            assert!(chad.inverse().is_some(), "{name}: chad singular");
+        }
+    }
+
+    // ---- compute_absolute_intent --------------------------------------------
+
+    #[test]
+    fn compute_absolute_intent_state_1_is_diagonal_ratios() {
+        // AdaptationState == 1.0 → pure diagonal of WPin/WPout ratios; CHADs unused.
+        let wp_in = CIEXYZ {
+            x: 0.95,
+            y: 1.0,
+            z: 1.08,
+        };
+        let wp_out = CIEXYZ {
+            x: 0.9642,
+            y: 1.0,
+            z: 0.8249,
+        };
+        // Use non-identity CHADs to prove they are ignored at state 1.0.
+        let chad_in = Mat3([1.1, 0.0, 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 1.3]);
+        let chad_out = Mat3([0.9, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.7]);
+        let m = compute_absolute_intent(1.0, &wp_in, &chad_in, &wp_out, &chad_out).unwrap();
+        let expected = Mat3([
+            wp_in.x / wp_out.x,
+            0.0,
+            0.0,
+            0.0,
+            wp_in.y / wp_out.y,
+            0.0,
+            0.0,
+            0.0,
+            wp_in.z / wp_out.z,
+        ]);
+        for k in 0..9 {
+            assert_eq!(m.0[k].to_bits(), expected.0[k].to_bits(), "entry {k}");
+        }
+    }
+
+    #[test]
+    fn compute_absolute_intent_state_1_same_wp_is_identity() {
+        // Identical white points at state 1.0 → exact identity ratios (1.0).
+        let wp = CIEXYZ {
+            x: 0.9642,
+            y: 1.0,
+            z: 0.8249,
+        };
+        let id = mat3_identity();
+        let m = compute_absolute_intent(1.0, &wp, &id, &wp, &id).unwrap();
+        assert!(is_empty_layer(&m, &Vec3([0.0, 0.0, 0.0])));
+    }
+
+    #[test]
+    fn compute_absolute_intent_state_0_uses_chads() {
+        // AdaptationState == 0.0 → m = (chad_out * scale) * chad_in^-1.
+        let wp_in = CIEXYZ {
+            x: 0.95,
+            y: 1.0,
+            z: 1.08,
+        };
+        let wp_out = CIEXYZ {
+            x: 0.9642,
+            y: 1.0,
+            z: 0.8249,
+        };
+        let chad_in = Mat3([1.1, 0.01, 0.0, 0.0, 1.2, 0.02, 0.0, 0.0, 1.3]);
+        let chad_out = Mat3([0.9, 0.0, 0.03, 0.0, 0.8, 0.0, 0.01, 0.0, 0.7]);
+        let scale = Mat3([
+            wp_in.x / wp_out.x,
+            0.0,
+            0.0,
+            0.0,
+            wp_in.y / wp_out.y,
+            0.0,
+            0.0,
+            0.0,
+            wp_in.z / wp_out.z,
+        ]);
+        let m2 = chad_out.per(&scale);
+        let expected = m2.per(&chad_in.inverse().unwrap());
+        let m = compute_absolute_intent(0.0, &wp_in, &chad_in, &wp_out, &chad_out).unwrap();
+        for k in 0..9 {
+            assert_eq!(m.0[k].to_bits(), expected.0[k].to_bits(), "entry {k}");
+        }
+    }
+
+    #[test]
+    fn compute_absolute_intent_fractional_unsupported() {
+        let wp = CIEXYZ {
+            x: 0.9642,
+            y: 1.0,
+            z: 0.8249,
+        };
+        let id = mat3_identity();
+        let err = compute_absolute_intent(0.5, &wp, &id, &wp, &id);
+        assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn compute_conversion_absolute_state_1_matches_diagonal() {
+        // End-to-end through compute_conversion: absolute intent at state 1.0 over
+        // two real profiles yields the WPin/WPout diagonal, offset zero.
+        let a = load("test5.icc");
+        let b = load("crayons.icc");
+        let pa = Profile::open(&a).unwrap();
+        let pb = Profile::open(&b).unwrap();
+        let profiles = [&pa, &pb];
+        let (m, off) = compute_conversion(
+            1,
+            &profiles,
+            RenderingIntent::AbsoluteColorimetric,
+            false,
+            1.0,
+        )
+        .unwrap();
+        let wp_in = read_media_white_point(&pa).unwrap();
+        let wp_out = read_media_white_point(&pb).unwrap();
+        let expected = Mat3([
+            wp_in.x / wp_out.x,
+            0.0,
+            0.0,
+            0.0,
+            wp_in.y / wp_out.y,
+            0.0,
+            0.0,
+            0.0,
+            wp_in.z / wp_out.z,
+        ]);
+        for k in 0..9 {
+            assert_eq!(m.0[k].to_bits(), expected.0[k].to_bits(), "entry {k}");
+        }
+        assert_eq!(off, Vec3([0.0, 0.0, 0.0]));
+    }
 
     #[test]
     fn compute_conversion_relative_is_identity() {
