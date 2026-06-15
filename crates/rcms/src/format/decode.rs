@@ -196,6 +196,9 @@ pub const TYPE_RGBA_FLT: u32 =
 pub const TYPE_BGR_FLT: u32 =
     float_sh(1) | colorspace_sh(PT_RGB) | channels_sh(3) | bytes_sh(4) | doswap_sh(1);
 pub const TYPE_CMYK_FLT: u32 = float_sh(1) | colorspace_sh(PT_CMYK) | channels_sh(4) | bytes_sh(4);
+/// `TYPE_Lab_16` (lcms2.h): 3-channel 16-bit Lab (the special ICC-Lab encoding is
+/// applied by the link's Lab decode stage, not the formatter — `Unroll3Words`).
+pub const TYPE_LAB_16: u32 = colorspace_sh(PT_LAB) | channels_sh(3) | bytes_sh(2);
 pub const TYPE_LAB_FLT: u32 = float_sh(1) | colorspace_sh(PT_LAB) | channels_sh(3) | bytes_sh(4);
 pub const TYPE_XYZ_FLT: u32 = float_sh(1) | colorspace_sh(PT_XYZ) | channels_sh(3) | bytes_sh(4);
 

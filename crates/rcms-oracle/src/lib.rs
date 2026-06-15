@@ -3099,6 +3099,196 @@ pub fn save_virtual_profile(which: i32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ==== slice9-gamut ====
+// FFI + safe wrappers for `cmsDetectTAC`, the proofing transform
+// (`cmsCreateProofingTransform` + `cmsDoTransform`, with/without gamut check and
+// custom alarm codes), and the gamut boundary descriptor check
+// (`cmsGBDAlloc`/`cmsGDBAddPoint`/`cmsGDBCompute`/`cmsGDBCheckPoint`).
+
+unsafe extern "C" {
+    fn rcms_oracle_detect_tac(bytes: *const u8, len: u32) -> f64;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_proofing_transform_packed(
+        in_bytes: *const u8,
+        in_len: u32,
+        out_bytes: *const u8,
+        out_len: u32,
+        proof_bytes: *const u8,
+        proof_len: u32,
+        n_intent: u32,
+        proof_intent: u32,
+        gamutcheck: i32,
+        softproofing: i32,
+        bpc: i32,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_proofing_transform_packed_alarm(
+        in_bytes: *const u8,
+        in_len: u32,
+        out_bytes: *const u8,
+        out_len: u32,
+        proof_bytes: *const u8,
+        proof_len: u32,
+        n_intent: u32,
+        proof_intent: u32,
+        gamutcheck: i32,
+        softproofing: i32,
+        bpc: i32,
+        alarm: *const u16,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
+    fn rcms_oracle_gbd_check(
+        add_lab: *const f64,
+        n_add: u32,
+        check_lab: *const f64,
+        n_check: u32,
+        verdicts: *mut i32,
+    ) -> i32;
+}
+
+/// Serializes the proofing-transform wrappers: lcms2's alarm codes live in a
+/// per-context global (the NULL context here), so concurrent calls that set them
+/// would race. The wrappers set + build + transform under this lock.
+static PROOFING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `cmsDetectTAC` over an in-memory profile. Returns 0.0 for non-output / failure
+/// (matching lcms2).
+pub fn detect_tac(bytes: &[u8]) -> f64 {
+    // SAFETY: `bytes` is a readable slice C only reads; the opened profile is
+    // freed inside the call.
+    unsafe { rcms_oracle_detect_tac(bytes.as_ptr(), bytes.len() as u32) }
+}
+
+/// `cmsCreateProofingTransform` + `cmsDoTransform` over packed byte buffers
+/// (always `cmsFLAGS_NOOPTIMIZE`). Returns `false` if the transform failed to
+/// build. `input`/`output` are sized per the in/out format bytes-per-pixel.
+#[allow(clippy::too_many_arguments)]
+pub fn proofing_transform_packed(
+    input_profile: &[u8],
+    output_profile: &[u8],
+    proofing_profile: &[u8],
+    n_intent: u32,
+    proof_intent: u32,
+    gamutcheck: bool,
+    softproofing: bool,
+    bpc: bool,
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    let _guard = PROOFING_LOCK.lock().unwrap();
+    // SAFETY: the three profile slices are readable, C only reads them and frees
+    // the opened handles; C reads `n_pixels` packed pixels of `in_fmt` from
+    // `input` and writes `n_pixels` packed pixels of `out_fmt` into `output`
+    // (the caller sizes both). The transform is freed inside the call. The lock
+    // serializes the global alarm-code state across parallel test threads.
+    let ok = unsafe {
+        rcms_oracle_proofing_transform_packed(
+            input_profile.as_ptr(),
+            input_profile.len() as u32,
+            output_profile.as_ptr(),
+            output_profile.len() as u32,
+            proofing_profile.as_ptr(),
+            proofing_profile.len() as u32,
+            n_intent,
+            proof_intent,
+            gamutcheck as i32,
+            softproofing as i32,
+            bpc as i32,
+            in_fmt,
+            out_fmt,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            n_pixels as u32,
+        )
+    };
+    ok != 0
+}
+
+/// Like [`proofing_transform_packed`] but sets custom `alarm` codes (16 entries)
+/// on the NULL context before building the transform, then restores the lcms2
+/// defaults. Exercises the gamut-check alarm-color substitution with known codes.
+#[allow(clippy::too_many_arguments)]
+pub fn proofing_transform_packed_alarm(
+    input_profile: &[u8],
+    output_profile: &[u8],
+    proofing_profile: &[u8],
+    n_intent: u32,
+    proof_intent: u32,
+    gamutcheck: bool,
+    softproofing: bool,
+    bpc: bool,
+    alarm: &[u16; 16],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    let _guard = PROOFING_LOCK.lock().unwrap();
+    // SAFETY: same contract as `proofing_transform_packed`; `alarm` is a readable
+    // 16-element array C copies into the context alarm codes before the build. The
+    // lock serializes the global alarm-code state across parallel test threads.
+    let ok = unsafe {
+        rcms_oracle_proofing_transform_packed_alarm(
+            input_profile.as_ptr(),
+            input_profile.len() as u32,
+            output_profile.as_ptr(),
+            output_profile.len() as u32,
+            proofing_profile.as_ptr(),
+            proofing_profile.len() as u32,
+            n_intent,
+            proof_intent,
+            gamutcheck as i32,
+            softproofing as i32,
+            bpc as i32,
+            alarm.as_ptr(),
+            in_fmt,
+            out_fmt,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            n_pixels as u32,
+        )
+    };
+    ok != 0
+}
+
+/// Gamut boundary descriptor round-trip: add `add_lab` points (flat `[L,a,b]`),
+/// `cmsGDBCompute`, then `cmsGDBCheckPoint` each of `check_lab`, returning one
+/// boolean verdict per checked point.
+pub fn gbd_check(add_lab: &[[f64; 3]], check_lab: &[[f64; 3]]) -> Vec<bool> {
+    let add_flat: Vec<f64> = add_lab.iter().flat_map(|p| p.iter().copied()).collect();
+    let check_flat: Vec<f64> = check_lab.iter().flat_map(|p| p.iter().copied()).collect();
+    let mut verdicts = vec![0i32; check_lab.len()];
+    // SAFETY: `add_flat`/`check_flat` are readable `nAdd*3`/`nCheck*3` f64 arrays;
+    // `verdicts` is a writable `nCheck` i32 array. The descriptor is freed inside.
+    let ok = unsafe {
+        rcms_oracle_gbd_check(
+            add_flat.as_ptr(),
+            add_lab.len() as u32,
+            check_flat.as_ptr(),
+            check_lab.len() as u32,
+            verdicts.as_mut_ptr(),
+        )
+    };
+    assert!(ok != 0, "rcms_oracle_gbd_check failed");
+    verdicts.into_iter().map(|v| v != 0).collect()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
