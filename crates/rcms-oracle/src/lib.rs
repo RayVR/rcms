@@ -416,6 +416,393 @@ unsafe extern "C" {
         out_chans: u32,
         n_pixels: u32,
     ) -> i32;
+
+    // Pixel-format unpack/pack via lcms2's real stock formatters (cmspack.c).
+    fn rcms_oracle_unpack16(fmt: u32, buf: *const u8, out: *mut u16);
+    fn rcms_oracle_pack16(fmt: u32, values: *const u16, out: *mut u8, nbytes: *mut u32);
+
+    // Float/double pixel-format formatters (CMS_PACK_FLAGS_FLOAT).
+    fn rcms_oracle_unpack_float(fmt: u32, buf: *const u8, out: *mut f32);
+    fn rcms_oracle_pack_float(fmt: u32, values: *const f32, out: *mut u8, nbytes: *mut u32);
+
+    // Format-aware do_transform (NOOPTIMIZE) over packed byte buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_do_transform_packed(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
+    // Format-aware do_transform with cmsFLAGS_COPY_ALPHA (| NOOPTIMIZE): copies
+    // the extra (alpha) channels straight from input to output with depth
+    // conversion via lcms2's _cmsHandleExtraChannels.
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_do_transform_packed_copyalpha(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
+    // Format-aware do_transform with lcms2's DEFAULT optimizer (no NOOPTIMIZE):
+    // exercises OptimizeMatrixShaper (MatShaperEval16) for RGB matrix-shaper
+    // transforms with an 8-bit input format.
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_transform_eval_default_8(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_transform_eval_default_16(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
+    fn rcms_oracle_from_8_to_16(v: u8) -> u16;
+    fn rcms_oracle_from_16_to_8(v: u16) -> u8;
+}
+
+/// Like [`do_transform_packed`] but with lcms2's **DEFAULT** optimizer enabled
+/// (no `cmsFLAGS_NOOPTIMIZE`). For an RGB→RGB matrix-shaper transform with an
+/// 8-bit input format this drives lcms2's `OptimizeMatrixShaper` /
+/// `MatShaperEval16` 1.14-fixed evaluator — the reference for rcms's
+/// `Lcms2Compat` matrix-shaper optimizer. `default_8` and `default_16` differ
+/// only in the formats the caller passes (8-bit vs 16-bit output); both still
+/// require an 8-bit *input* format for the matrix-shaper path to fire in lcms2.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed_default_8(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    do_transform_packed_default_impl(
+        profiles, intents, bpc, adaptation, in_fmt, out_fmt, input, output, n_pixels, false,
+    )
+}
+
+/// Like [`do_transform_packed`] but builds the transform with lcms2's **DEFAULT**
+/// optimizer enabled (`cmsCreateExtendedTransform(.., /*flags*/ 0)` + the full
+/// optimizer chain: `OptimizeByJoiningCurves` / `OptimizeMatrixShaper` /
+/// `OptimizeByComputingLinearization` / `OptimizeByResampling`). This is the
+/// reference for rcms's `OptimizationStrategy::Lcms2Compat` over arbitrary
+/// formats (8/16-bit, any device colorspace) — the `_8`/`_16` siblings are
+/// historical aliases that call the SAME flags-0 C entry.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed_default(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    do_transform_packed_default_impl(
+        profiles, intents, bpc, adaptation, in_fmt, out_fmt, input, output, n_pixels, false,
+    )
+}
+
+/// 16-bit-output sibling of [`do_transform_packed_default_8`]; see its docs.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed_default_16(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    do_transform_packed_default_impl(
+        profiles, intents, bpc, adaptation, in_fmt, out_fmt, input, output, n_pixels, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_transform_packed_default_impl(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+    use_16: bool,
+) -> bool {
+    let n = profiles.len();
+    assert_eq!(intents.len(), n);
+    assert_eq!(bpc.len(), n);
+    assert_eq!(adaptation.len(), n);
+
+    let bufs: Vec<*const u8> = profiles.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<u32> = profiles.iter().map(|p| p.len() as u32).collect();
+    let bpc_i: Vec<i32> = bpc.iter().map(|&b| b as i32).collect();
+
+    // SAFETY: identical contract to `do_transform_packed` — `bufs`/`lens`
+    // describe `n` readable profile slices; `intents`/`bpc_i`/`adaptation` are
+    // `n`-element readable arrays; C reads `n_pixels` packed pixels of `in_fmt`
+    // from `input` and writes `n_pixels` packed pixels of `out_fmt` into
+    // `output` (the caller sizes both). The only difference is the transform is
+    // built with the DEFAULT optimizer (dwFlags == 0).
+    let ok = unsafe {
+        if use_16 {
+            rcms_oracle_transform_eval_default_16(
+                bufs.as_ptr(),
+                lens.as_ptr(),
+                n as u32,
+                intents.as_ptr(),
+                bpc_i.as_ptr(),
+                adaptation.as_ptr(),
+                in_fmt,
+                out_fmt,
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                n_pixels as u32,
+            )
+        } else {
+            rcms_oracle_transform_eval_default_8(
+                bufs.as_ptr(),
+                lens.as_ptr(),
+                n as u32,
+                intents.as_ptr(),
+                bpc_i.as_ptr(),
+                adaptation.as_ptr(),
+                in_fmt,
+                out_fmt,
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                n_pixels as u32,
+            )
+        }
+    };
+    ok != 0
+}
+
+/// lcms2 `FROM_8_TO_16` (lcms2_internal.h:125).
+pub fn from_8_to_16(v: u8) -> u16 {
+    // SAFETY: pure arithmetic macro, no pointers.
+    unsafe { rcms_oracle_from_8_to_16(v) }
+}
+
+/// lcms2 `FROM_16_TO_8` (lcms2_internal.h:126).
+pub fn from_16_to_8(v: u16) -> u8 {
+    // SAFETY: pure arithmetic macro, no pointers.
+    unsafe { rcms_oracle_from_16_to_8(v) }
+}
+
+/// lcms2 `cmsMAXCHANNELS` — the width of the formatter value array.
+pub const MAX_CHANNELS: usize = 16;
+
+/// Drive lcms2's real stock unpack formatter for `fmt` on `buf` and return the
+/// 16-bit values it produces (cmsMAXCHANNELS wide; channels beyond the format's
+/// T_CHANNELS are left zero, as lcms2 never writes them).
+///
+/// `buf` must hold at least one packed pixel for `fmt`; the caller sizes it.
+pub fn unpack16(fmt: u32, buf: &[u8]) -> [u16; MAX_CHANNELS] {
+    let mut out = [0u16; MAX_CHANNELS];
+    // SAFETY: `buf` is a valid readable slice; lcms2's stock 16-bit formatters
+    // read only the bytes for one pixel of `fmt` (which the caller guarantees
+    // are present) and write only T_CHANNELS(fmt) <= MAX_CHANNELS u16 entries
+    // into `out`. The shim sets a zeroed _cmsTRANSFORM with only InputFormat,
+    // which is the sole field these formatters read.
+    unsafe {
+        rcms_oracle_unpack16(fmt, buf.as_ptr(), out.as_mut_ptr());
+    }
+    out
+}
+
+/// Drive lcms2's real stock pack formatter for `fmt` on `values` and return the
+/// packed bytes it writes. `out` must be large enough for one packed pixel of
+/// `fmt`; the returned slice length is the byte count lcms2 advanced.
+pub fn pack16(fmt: u32, values: &[u16; MAX_CHANNELS], out: &mut [u8]) -> usize {
+    let mut nbytes: u32 = 0;
+    // SAFETY: `values` is MAX_CHANNELS wide (lcms2 reads at most T_CHANNELS +
+    // T_EXTRA entries); `out` is a valid writable slice the caller sized to one
+    // packed pixel for `fmt`. The shim sets a zeroed _cmsTRANSFORM with only
+    // OutputFormat, the sole field these packers read, and returns the advanced
+    // byte count via `nbytes`.
+    unsafe {
+        rcms_oracle_pack16(fmt, values.as_ptr(), out.as_mut_ptr(), &mut nbytes);
+    }
+    nbytes as usize
+}
+
+/// Drive lcms2's real stock FLOAT unpack formatter for `fmt` on `buf`
+/// (`_cmsGetFormatter(..., CMS_PACK_FLAGS_FLOAT)`) and return the f32 values it
+/// produces (cmsMAXCHANNELS wide; channels beyond T_CHANNELS left zero).
+///
+/// `buf` must hold at least one packed pixel for `fmt`.
+pub fn unpack_float(fmt: u32, buf: &[u8]) -> [f32; MAX_CHANNELS] {
+    let mut out = [0f32; MAX_CHANNELS];
+    // SAFETY: `buf` is a valid readable slice holding one packed pixel of `fmt`;
+    // lcms2's stock float formatters read only those bytes and write only
+    // T_CHANNELS(fmt) <= MAX_CHANNELS f32 entries into `out`. The shim sets a
+    // zeroed _cmsTRANSFORM with only InputFormat, the sole field they read.
+    unsafe {
+        rcms_oracle_unpack_float(fmt, buf.as_ptr(), out.as_mut_ptr());
+    }
+    out
+}
+
+/// Drive lcms2's real stock FLOAT pack formatter for `fmt` on `values` and return
+/// the packed bytes it writes. `out` must be large enough for one packed pixel of
+/// `fmt`; the return value is the byte count lcms2 advanced.
+pub fn pack_float(fmt: u32, values: &[f32; MAX_CHANNELS], out: &mut [u8]) -> usize {
+    let mut nbytes: u32 = 0;
+    // SAFETY: `values` is MAX_CHANNELS wide (lcms2 reads at most T_CHANNELS +
+    // T_EXTRA entries); `out` is a valid writable slice sized to one packed pixel
+    // for `fmt`. The shim sets a zeroed _cmsTRANSFORM with only OutputFormat and
+    // returns the advanced byte count via `nbytes`.
+    unsafe {
+        rcms_oracle_pack_float(fmt, values.as_ptr(), out.as_mut_ptr(), &mut nbytes);
+    }
+    nbytes as usize
+}
+
+/// lcms2 `cmsCreateExtendedTransform` (NOOPTIMIZE) over `profiles` with the
+/// caller's explicit in/out format words, then `cmsDoTransform` over `n_pixels`
+/// packed pixels. `input` is `n_pixels * <bytes-per-pixel(in_fmt)>` bytes;
+/// `output` is sized for `n_pixels * <bytes-per-pixel(out_fmt)>` and written in
+/// place. Returns `true` on success, `false` if a profile fails to open or the
+/// transform cannot be created. This is the format-aware end-to-end reference.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    let n = profiles.len();
+    assert_eq!(intents.len(), n);
+    assert_eq!(bpc.len(), n);
+    assert_eq!(adaptation.len(), n);
+
+    let bufs: Vec<*const u8> = profiles.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<u32> = profiles.iter().map(|p| p.len() as u32).collect();
+    let bpc_i: Vec<i32> = bpc.iter().map(|&b| b as i32).collect();
+
+    // SAFETY: `bufs`/`lens` describe `n` valid readable profile slices C only
+    // reads; `intents`/`bpc_i`/`adaptation` are `n`-element readable arrays. C
+    // reads `n_pixels` packed pixels of `in_fmt` from `input` and writes
+    // `n_pixels` packed pixels of `out_fmt` into `output`; the caller sizes both.
+    // The transform and all profiles are freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_do_transform_packed(
+            bufs.as_ptr(),
+            lens.as_ptr(),
+            n as u32,
+            intents.as_ptr(),
+            bpc_i.as_ptr(),
+            adaptation.as_ptr(),
+            in_fmt,
+            out_fmt,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            n_pixels as u32,
+        )
+    };
+    ok != 0
+}
+
+/// Like [`do_transform_packed`] but builds the transform with
+/// `cmsFLAGS_COPY_ALPHA | cmsFLAGS_NOOPTIMIZE`, so lcms2's
+/// `_cmsHandleExtraChannels` copies the extra (alpha) channels straight from
+/// input to output (depth-converting them via `_cmsGetFormatterAlpha`) WITHOUT
+/// color-transforming them. The reference for rcms's COPY_ALPHA extra-channel
+/// copy. `input`/`output` are sized per the in/out format bytes-per-pixel.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed_copyalpha(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    let n = profiles.len();
+    assert_eq!(intents.len(), n);
+    assert_eq!(bpc.len(), n);
+    assert_eq!(adaptation.len(), n);
+
+    let bufs: Vec<*const u8> = profiles.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<u32> = profiles.iter().map(|p| p.len() as u32).collect();
+    let bpc_i: Vec<i32> = bpc.iter().map(|&b| b as i32).collect();
+
+    // SAFETY: identical contract to `do_transform_packed` — `bufs`/`lens`
+    // describe `n` readable profile slices; `intents`/`bpc_i`/`adaptation` are
+    // `n`-element readable arrays; C reads `n_pixels` packed pixels of `in_fmt`
+    // from `input` and writes `n_pixels` packed pixels of `out_fmt` into
+    // `output` (the caller sizes both). The only difference is the transform is
+    // built with cmsFLAGS_COPY_ALPHA so extra channels are copied across.
+    let ok = unsafe {
+        rcms_oracle_do_transform_packed_copyalpha(
+            bufs.as_ptr(),
+            lens.as_ptr(),
+            n as u32,
+            intents.as_ptr(),
+            bpc_i.as_ptr(),
+            adaptation.as_ptr(),
+            in_fmt,
+            out_fmt,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            n_pixels as u32,
+        )
+    };
+    ok != 0
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).

@@ -1555,3 +1555,230 @@ int rcms_oracle_transform_eval_16(const uint8_t* const* bufs, const uint32_t* le
     free(profiles); free(bpcArr); free(intArr); free(adArr);
     return ok;
 }
+
+/* ---- Pixel-format unpack/pack formatters (cmspack.c) ----------------------
+   Drive lcms2's REAL stock unpack/pack formatters in isolation. The stock
+   16-bit formatters read only info->InputFormat / info->OutputFormat (verified
+   against cmspack.c: every formatter pulls T_* fields off that one word and
+   touches no other transform field), so a zeroed _cmsTRANSFORM with just the
+   format word set reproduces exactly what cmsDoTransform's FromInput/ToOutput
+   would do for these simple chunky/planar-free types. We fetch the formatter
+   via the exported _cmsGetFormatter(NULL, fmt, dir, CMS_PACK_FLAGS_16BITS) and
+   call its .Fmt16 pointer. Stride is 0 (chunky single pixel). */
+
+void rcms_oracle_unpack16(uint32_t fmt, const uint8_t* buf, uint16_t* out) {
+    _cmsTRANSFORM info;
+    memset(&info, 0, sizeof(info));
+    info.InputFormat = fmt;
+    cmsFormatter fn = _cmsGetFormatter(NULL, fmt, cmsFormatterInput, CMS_PACK_FLAGS_16BITS);
+    if (fn.Fmt16 == NULL) return;
+    /* Formatter writes only T_CHANNELS(fmt) entries; caller zeroes the rest. */
+    fn.Fmt16(&info, out, (cmsUInt8Number*) buf, 0);
+}
+
+void rcms_oracle_pack16(uint32_t fmt, const uint16_t* values, uint8_t* out, uint32_t* nbytes) {
+    _cmsTRANSFORM info;
+    memset(&info, 0, sizeof(info));
+    info.OutputFormat = fmt;
+    cmsFormatter fn = _cmsGetFormatter(NULL, fmt, cmsFormatterOutput, CMS_PACK_FLAGS_16BITS);
+    if (fn.Fmt16 == NULL) { *nbytes = 0; return; }
+    /* cmsUInt16Number wOut[] is const-by-contract for packers; cast away const. */
+    cmsUInt8Number* end = fn.Fmt16(&info, (cmsUInt16Number*) values, out, 0);
+    *nbytes = (uint32_t) (end - out);
+}
+
+/* lcms2 FROM_8_TO_16 / FROM_16_TO_8 (lcms2_internal.h:125-126). */
+uint16_t rcms_oracle_from_8_to_16(uint8_t v) { return FROM_8_TO_16(v); }
+uint8_t  rcms_oracle_from_16_to_8(uint16_t v) { return FROM_16_TO_8(v); }
+
+/* ---- Float/double pixel-format formatters (cmspack.c, FLOAT table) ---------
+   Drive lcms2's REAL stock float unpack/pack formatters in isolation via
+   _cmsGetFormatter(..., CMS_PACK_FLAGS_FLOAT). Like the 16-bit shims above, the
+   float formatters read only info->InputFormat / info->OutputFormat, so a zeroed
+   _cmsTRANSFORM with the one format word set reproduces what FloatXFORM's
+   FromInputFloat/ToOutputFloat do for these chunky, non-planar types. The unpack
+   writes T_CHANNELS(fmt) f32 entries into `out` (caller zeroes the rest); the
+   pack reads from `values` (cmsMAXCHANNELS f32) and returns the advanced byte
+   count in `*nbytes`. */
+
+void rcms_oracle_unpack_float(uint32_t fmt, const uint8_t* buf, float* out) {
+    _cmsTRANSFORM info;
+    memset(&info, 0, sizeof(info));
+    info.InputFormat = fmt;
+    cmsFormatter fn = _cmsGetFormatter(NULL, fmt, cmsFormatterInput, CMS_PACK_FLAGS_FLOAT);
+    if (fn.FmtFloat == NULL) return;
+    fn.FmtFloat(&info, out, (cmsUInt8Number*) buf, 0);
+}
+
+void rcms_oracle_pack_float(uint32_t fmt, const float* values, uint8_t* out, uint32_t* nbytes) {
+    _cmsTRANSFORM info;
+    memset(&info, 0, sizeof(info));
+    info.OutputFormat = fmt;
+    cmsFormatter fn = _cmsGetFormatter(NULL, fmt, cmsFormatterOutput, CMS_PACK_FLAGS_FLOAT);
+    if (fn.FmtFloat == NULL) { *nbytes = 0; return; }
+    cmsUInt8Number* end = fn.FmtFloat(&info, (cmsFloat32Number*) values, out, 0);
+    *nbytes = (uint32_t) (end - out);
+}
+
+/* ---- Format-aware do_transform (NOOPTIMIZE) over packed buffers ------------
+   Build a 2..N-profile cmsCreateExtendedTransform with the caller's explicit
+   in/out FORMAT WORDS (e.g. TYPE_RGB_8, TYPE_CMYK_FLT), forcing NOOPTIMIZE, then
+   cmsDoTransform over `nPixels` packed pixels. `inBuf`/`outBuf` are raw byte
+   buffers the caller sizes to nPixels * <bytes-per-pixel of the respective
+   format>. Returns 1 on success, 0 if any profile fails to open or the transform
+   cannot be built. */
+int rcms_oracle_do_transform_packed(const uint8_t* const* bufs, const uint32_t* lens,
+                                    uint32_t n, const uint32_t* intents,
+                                    const int32_t* bpc, const double* adaptation,
+                                    uint32_t inFmt, uint32_t outFmt,
+                                    const uint8_t* inBuf, uint8_t* outBuf,
+                                    uint32_t nPixels) {
+    if (n == 0 || n > 255) return 0;
+    cmsHPROFILE* profiles = (cmsHPROFILE*) calloc(n, sizeof(cmsHPROFILE));
+    cmsBool*     bpcArr    = (cmsBool*)    calloc(n, sizeof(cmsBool));
+    cmsUInt32Number* intArr = (cmsUInt32Number*) calloc(n, sizeof(cmsUInt32Number));
+    cmsFloat64Number* adArr = (cmsFloat64Number*) calloc(n, sizeof(cmsFloat64Number));
+    if (!profiles || !bpcArr || !intArr || !adArr) {
+        free(profiles); free(bpcArr); free(intArr); free(adArr);
+        return 0;
+    }
+    int ok = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        profiles[i] = cmsOpenProfileFromMem((const void*) bufs[i], lens[i]);
+        if (!profiles[i]) ok = 0;
+        bpcArr[i] = bpc[i] ? TRUE : FALSE;
+        intArr[i] = intents[i];
+        adArr[i]  = adaptation[i];
+    }
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateExtendedTransform(
+            NULL, n, profiles, bpcArr, intArr, adArr,
+            NULL, 0, inFmt, outFmt, cmsFLAGS_NOOPTIMIZE);
+    }
+    if (xform) {
+        cmsDoTransform(xform, inBuf, outBuf, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    for (uint32_t i = 0; i < n; i++) if (profiles[i]) cmsCloseProfile(profiles[i]);
+    free(profiles); free(bpcArr); free(intArr); free(adArr);
+    return ok;
+}
+
+/* ---- Format-aware do_transform with lcms2's DEFAULT optimizer --------------
+   Identical to rcms_oracle_do_transform_packed but WITHOUT cmsFLAGS_NOOPTIMIZE,
+   so lcms2 runs its default optimization passes (OptimizeMatrixShaper /
+   OptimizeByJoiningCurves / OptimizeByComputingLinearization / OptimizeByResampling).
+   For RGB matrix-shaper transforms with an 8-bit input format this exercises the
+   MatShaperEval16 1.14-fixed-point evaluator. Used to diff-test rcms's Lcms2Compat
+   matrix-shaper optimizer for drop-in bit-identity with stock lcms2-default. */
+static int rcms_oracle_do_transform_default(const uint8_t* const* bufs, const uint32_t* lens,
+                                            uint32_t n, const uint32_t* intents,
+                                            const int32_t* bpc, const double* adaptation,
+                                            uint32_t inFmt, uint32_t outFmt,
+                                            const uint8_t* inBuf, uint8_t* outBuf,
+                                            uint32_t nPixels) {
+    if (n == 0 || n > 255) return 0;
+    cmsHPROFILE* profiles = (cmsHPROFILE*) calloc(n, sizeof(cmsHPROFILE));
+    cmsBool*     bpcArr    = (cmsBool*)    calloc(n, sizeof(cmsBool));
+    cmsUInt32Number* intArr = (cmsUInt32Number*) calloc(n, sizeof(cmsUInt32Number));
+    cmsFloat64Number* adArr = (cmsFloat64Number*) calloc(n, sizeof(cmsFloat64Number));
+    if (!profiles || !bpcArr || !intArr || !adArr) {
+        free(profiles); free(bpcArr); free(intArr); free(adArr);
+        return 0;
+    }
+    int ok = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        profiles[i] = cmsOpenProfileFromMem((const void*) bufs[i], lens[i]);
+        if (!profiles[i]) ok = 0;
+        bpcArr[i] = bpc[i] ? TRUE : FALSE;
+        intArr[i] = intents[i];
+        adArr[i]  = adaptation[i];
+    }
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateExtendedTransform(
+            NULL, n, profiles, bpcArr, intArr, adArr,
+            NULL, 0, inFmt, outFmt, 0 /* DEFAULT: run the optimizer */);
+    }
+    if (xform) {
+        cmsDoTransform(xform, inBuf, outBuf, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    for (uint32_t i = 0; i < n; i++) if (profiles[i]) cmsCloseProfile(profiles[i]);
+    free(profiles); free(bpcArr); free(intArr); free(adArr);
+    return ok;
+}
+
+int rcms_oracle_transform_eval_default_8(const uint8_t* const* bufs, const uint32_t* lens,
+                                         uint32_t n, const uint32_t* intents,
+                                         const int32_t* bpc, const double* adaptation,
+                                         uint32_t inFmt, uint32_t outFmt,
+                                         const uint8_t* inBuf, uint8_t* outBuf,
+                                         uint32_t nPixels) {
+    return rcms_oracle_do_transform_default(bufs, lens, n, intents, bpc, adaptation,
+                                            inFmt, outFmt, inBuf, outBuf, nPixels);
+}
+
+int rcms_oracle_transform_eval_default_16(const uint8_t* const* bufs, const uint32_t* lens,
+                                          uint32_t n, const uint32_t* intents,
+                                          const int32_t* bpc, const double* adaptation,
+                                          uint32_t inFmt, uint32_t outFmt,
+                                          const uint8_t* inBuf, uint8_t* outBuf,
+                                          uint32_t nPixels) {
+    return rcms_oracle_do_transform_default(bufs, lens, n, intents, bpc, adaptation,
+                                            inFmt, outFmt, inBuf, outBuf, nPixels);
+}
+
+/* ---- Format-aware do_transform with cmsFLAGS_COPY_ALPHA --------------------
+   Identical to rcms_oracle_do_transform_packed but builds the transform with
+   (cmsFLAGS_COPY_ALPHA | cmsFLAGS_NOOPTIMIZE), so lcms2's _cmsHandleExtraChannels
+   copies the extra (alpha) channels straight from input to output with depth
+   conversion (the _cmsGetFormatterAlpha table) WITHOUT color-transforming them.
+   Used to diff-test rcms's COPY_ALPHA extra-channel copy. */
+int rcms_oracle_do_transform_packed_copyalpha(const uint8_t* const* bufs, const uint32_t* lens,
+                                              uint32_t n, const uint32_t* intents,
+                                              const int32_t* bpc, const double* adaptation,
+                                              uint32_t inFmt, uint32_t outFmt,
+                                              const uint8_t* inBuf, uint8_t* outBuf,
+                                              uint32_t nPixels) {
+    if (n == 0 || n > 255) return 0;
+    cmsHPROFILE* profiles = (cmsHPROFILE*) calloc(n, sizeof(cmsHPROFILE));
+    cmsBool*     bpcArr    = (cmsBool*)    calloc(n, sizeof(cmsBool));
+    cmsUInt32Number* intArr = (cmsUInt32Number*) calloc(n, sizeof(cmsUInt32Number));
+    cmsFloat64Number* adArr = (cmsFloat64Number*) calloc(n, sizeof(cmsFloat64Number));
+    if (!profiles || !bpcArr || !intArr || !adArr) {
+        free(profiles); free(bpcArr); free(intArr); free(adArr);
+        return 0;
+    }
+    int ok = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        profiles[i] = cmsOpenProfileFromMem((const void*) bufs[i], lens[i]);
+        if (!profiles[i]) ok = 0;
+        bpcArr[i] = bpc[i] ? TRUE : FALSE;
+        intArr[i] = intents[i];
+        adArr[i]  = adaptation[i];
+    }
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateExtendedTransform(
+            NULL, n, profiles, bpcArr, intArr, adArr,
+            NULL, 0, inFmt, outFmt, cmsFLAGS_COPY_ALPHA | cmsFLAGS_NOOPTIMIZE);
+    }
+    if (xform) {
+        cmsDoTransform(xform, inBuf, outBuf, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    for (uint32_t i = 0; i < n; i++) if (profiles[i]) cmsCloseProfile(profiles[i]);
+    free(profiles); free(bpcArr); free(intArr); free(adArr);
+    return ok;
+}
