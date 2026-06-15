@@ -34,12 +34,14 @@
 //! construction and produces an [`OptimizedEval`] the per-pixel `do_transform`
 //! loop calls — swapping strategies never touches the formatter or the loop.
 
+pub mod batched;
 pub mod joincurves;
 pub mod lossless_matshaper;
 pub mod matshaper;
 pub mod resampling;
 
 use crate::pipeline::Pipeline;
+use batched::BatchedPipeline;
 use joincurves::CurvesEval;
 use lossless_matshaper::LosslessMatShaper;
 use matshaper::MatShaper8Data;
@@ -94,6 +96,13 @@ pub enum OptimizedEval {
     /// identical to [`Pipeline`](Self::Pipeline); boxed (the LUTs + curves are a
     /// few KB).
     LosslessMatShaper(Box<LosslessMatShaper>),
+    /// The LOSSLESS BATCHED general/CLUT fast path fired
+    /// ([`AccurateFast`](OptimizationStrategy::AccurateFast)): the pipeline's
+    /// stages with the CLUT interpolator resolved once at build and (for 8-bit
+    /// input) the first tone-curve stage memoized into byte LUTs, evaluated a
+    /// CHUNK of pixels at a time (stage-outer/pixel-inner). Byte-for-byte identical
+    /// to [`Pipeline`](Self::Pipeline); boxed (it owns the CLUT grid copies).
+    Batched(Box<BatchedPipeline>),
 }
 
 /// A custom pipeline optimizer (lcms2 `cmsPluginOptimization`). Registered via
@@ -144,8 +153,15 @@ impl OptimizationStrategy {
     /// fall back to the in-place pipeline eval (the accurate path). Never changes
     /// an output bit versus [`Accurate`](Self::Accurate).
     fn accurate_fast(lut: &Pipeline, in_fmt: u32, out_fmt: u32) -> OptimizedEval {
+        // 1. The matrix-shaper shape (Task 1) — RGB 8-bit-input C-M-C.
         if let Some(eval) = lossless_matshaper::try_optimize(lut, in_fmt, out_fmt) {
             return OptimizedEval::LosslessMatShaper(Box::new(eval));
+        }
+        // 2. The general/CLUT path: batched stage-by-stage eval with the CLUT
+        //    interpolator resolved once + (for 8-bit input) memoized input curves.
+        //    Byte-for-byte identical to the in-place Pipeline eval.
+        if let Some(eval) = batched::try_optimize(lut, in_fmt, out_fmt) {
+            return OptimizedEval::Batched(Box::new(eval));
         }
         OptimizedEval::Pipeline
     }
