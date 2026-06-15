@@ -16,6 +16,7 @@ pub mod curve;
 pub mod error;
 pub mod fixed;
 pub mod format;
+pub mod gamut;
 pub mod interp;
 pub mod io;
 pub mod link;

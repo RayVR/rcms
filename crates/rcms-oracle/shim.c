@@ -2653,3 +2653,132 @@ int rcms_oracle_named_transform_16(const uint8_t* named_bytes, uint32_t named_le
     return ok;
 }
 /* ==== end slice9-named ==== */
+
+// ==== slice9-gamut ====
+// Total area coverage, proofing transform (with/without gamut check), and the
+// gamut boundary descriptor check-point — references for the rcms `crate::gamut`
+// port. Each opens profiles from memory, drives the lcms2 primitive, and frees.
+
+double rcms_oracle_detect_tac(const uint8_t* bytes, uint32_t len) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0.0;
+    double tac = cmsDetectTAC(h);
+    cmsCloseProfile(h);
+    return tac;
+}
+
+// Proofing transform over packed byte buffers. `gamutcheck`/`softproofing`/`bpc`
+// select the dwFlags; `nIntent`/`proofIntent` the two intents. Always adds
+// cmsFLAGS_NOOPTIMIZE so the differential isolates the proofing/gamut-check math.
+int rcms_oracle_proofing_transform_packed(
+        const uint8_t* inBytes, uint32_t inLen,
+        const uint8_t* outBytes, uint32_t outLen,
+        const uint8_t* proofBytes, uint32_t proofLen,
+        uint32_t nIntent, uint32_t proofIntent,
+        int gamutcheck, int softproofing, int bpc,
+        uint32_t inFmt, uint32_t outFmt,
+        const uint8_t* inBuf, uint8_t* outBuf, uint32_t nPixels) {
+
+    // The alarm codes are a per-context global; reset to the lcms2 default so this
+    // call is deterministic regardless of any prior `...alarm` call (tests run in
+    // parallel threads sharing the NULL context).
+    cmsUInt16Number defAlarm[cmsMAXCHANNELS] = { 0x7F00, 0x7F00, 0x7F00 };
+    cmsSetAlarmCodes(defAlarm);
+
+    cmsHPROFILE hin = cmsOpenProfileFromMem((const void*) inBytes, inLen);
+    cmsHPROFILE hout = cmsOpenProfileFromMem((const void*) outBytes, outLen);
+    cmsHPROFILE hproof = cmsOpenProfileFromMem((const void*) proofBytes, proofLen);
+    int ok = (hin && hout && hproof) ? 1 : 0;
+
+    cmsUInt32Number flags = cmsFLAGS_NOOPTIMIZE;
+    if (gamutcheck) flags |= cmsFLAGS_GAMUTCHECK;
+    if (softproofing) flags |= cmsFLAGS_SOFTPROOFING;
+    if (bpc) flags |= cmsFLAGS_BLACKPOINTCOMPENSATION;
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateProofingTransformTHR(
+            NULL, hin, inFmt, hout, outFmt, hproof,
+            nIntent, proofIntent, flags);
+    }
+    if (xform) {
+        cmsDoTransform(xform, inBuf, outBuf, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    if (hin) cmsCloseProfile(hin);
+    if (hout) cmsCloseProfile(hout);
+    if (hproof) cmsCloseProfile(hproof);
+    return ok;
+}
+
+// Set the (default-overriding) alarm codes before building a proofing transform,
+// so the gamut-check alarm path is exercised with known codes. The alarm codes
+// are a per-context global in lcms2; we set them on the NULL context here.
+int rcms_oracle_proofing_transform_packed_alarm(
+        const uint8_t* inBytes, uint32_t inLen,
+        const uint8_t* outBytes, uint32_t outLen,
+        const uint8_t* proofBytes, uint32_t proofLen,
+        uint32_t nIntent, uint32_t proofIntent,
+        int gamutcheck, int softproofing, int bpc,
+        const uint16_t* alarm /* [16] */,
+        uint32_t inFmt, uint32_t outFmt,
+        const uint8_t* inBuf, uint8_t* outBuf, uint32_t nPixels) {
+
+    cmsUInt16Number codes[cmsMAXCHANNELS];
+    for (int i = 0; i < cmsMAXCHANNELS; i++) codes[i] = alarm[i];
+    cmsSetAlarmCodes(codes);
+
+    cmsHPROFILE hin = cmsOpenProfileFromMem((const void*) inBytes, inLen);
+    cmsHPROFILE hout = cmsOpenProfileFromMem((const void*) outBytes, outLen);
+    cmsHPROFILE hproof = cmsOpenProfileFromMem((const void*) proofBytes, proofLen);
+    int ok = (hin && hout && hproof) ? 1 : 0;
+
+    cmsUInt32Number flags = cmsFLAGS_NOOPTIMIZE;
+    if (gamutcheck) flags |= cmsFLAGS_GAMUTCHECK;
+    if (softproofing) flags |= cmsFLAGS_SOFTPROOFING;
+    if (bpc) flags |= cmsFLAGS_BLACKPOINTCOMPENSATION;
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateProofingTransformTHR(
+            NULL, hin, inFmt, hout, outFmt, hproof,
+            nIntent, proofIntent, flags);
+    }
+    if (xform) {
+        cmsDoTransform(xform, inBuf, outBuf, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    if (hin) cmsCloseProfile(hin);
+    if (hout) cmsCloseProfile(hout);
+    if (hproof) cmsCloseProfile(hproof);
+
+    // Restore the lcms2 default alarm codes for subsequent calls.
+    cmsUInt16Number def[cmsMAXCHANNELS] = { 0x7F00, 0x7F00, 0x7F00 };
+    cmsSetAlarmCodes(def);
+    return ok;
+}
+
+// Gamut boundary descriptor round-trip: add `nAdd` Lab points, compute, then
+// check `nCheck` Lab points, writing the boolean verdicts into `verdicts`.
+// `addLab`/`checkLab` are flat [L,a,b] triples.
+int rcms_oracle_gbd_check(const double* addLab, uint32_t nAdd,
+                          const double* checkLab, uint32_t nCheck,
+                          int32_t* verdicts /* [nCheck] */) {
+    cmsHANDLE gbd = cmsGBDAlloc(NULL);
+    if (!gbd) return 0;
+    for (uint32_t i = 0; i < nAdd; i++) {
+        cmsCIELab lab = { addLab[i*3+0], addLab[i*3+1], addLab[i*3+2] };
+        cmsGDBAddPoint(gbd, &lab);
+    }
+    cmsGDBCompute(gbd, 0);
+    for (uint32_t i = 0; i < nCheck; i++) {
+        cmsCIELab lab = { checkLab[i*3+0], checkLab[i*3+1], checkLab[i*3+2] };
+        verdicts[i] = cmsGDBCheckPoint(gbd, &lab) ? 1 : 0;
+    }
+    cmsGBDFree(gbd);
+    return 1;
+}
