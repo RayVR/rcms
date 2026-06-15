@@ -21,6 +21,7 @@ pub mod pcs;
 pub mod pipeline;
 pub mod profile;
 pub mod sig;
+pub mod transform;
 
 pub use error::{Error, Result};
 
@@ -39,4 +40,5 @@ pub mod prelude {
     pub use crate::pipeline::{Pipeline, Stage};
     pub use crate::profile::{Header, Profile, Tag};
     pub use crate::sig::Signature;
+    pub use crate::transform::{Flags, Transform};
 }

@@ -1505,3 +1505,53 @@ int rcms_oracle_transform_eval_float(const uint8_t* const* bufs, const uint32_t*
     free(profiles); free(bpcArr); free(intArr); free(adArr);
     return ok;
 }
+
+/* Same as rcms_oracle_transform_eval_float but 16-bit: input/output formats are
+   generic 16-bit (FLOAT_SH(0)|PT_ANY|CHANNELS_SH(n)|BYTES_SH(2)), so the
+   PrecalculatedXFORM/CachedXFORM path runs and cmsDoTransform reads/writes u16.
+   `in`/`out` carry nPixels*inChans / nPixels*outChans uint16 row-major. Returns 1
+   on success, 0 on failure. */
+static uint32_t u16_format(uint32_t nChans) {
+    return COLORSPACE_SH(PT_ANY) | CHANNELS_SH(nChans) | BYTES_SH(2);
+}
+
+int rcms_oracle_transform_eval_16(const uint8_t* const* bufs, const uint32_t* lens,
+                                  uint32_t n, const uint32_t* intents,
+                                  const int32_t* bpc, const double* adaptation,
+                                  const uint16_t* in, uint32_t inChans,
+                                  uint16_t* out, uint32_t outChans, uint32_t nPixels) {
+    if (n == 0 || n > 255) return 0;
+    cmsHPROFILE* profiles = (cmsHPROFILE*) calloc(n, sizeof(cmsHPROFILE));
+    cmsBool*     bpcArr    = (cmsBool*)    calloc(n, sizeof(cmsBool));
+    cmsUInt32Number* intArr = (cmsUInt32Number*) calloc(n, sizeof(cmsUInt32Number));
+    cmsFloat64Number* adArr = (cmsFloat64Number*) calloc(n, sizeof(cmsFloat64Number));
+    if (!profiles || !bpcArr || !intArr || !adArr) {
+        free(profiles); free(bpcArr); free(intArr); free(adArr);
+        return 0;
+    }
+    int ok = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        profiles[i] = cmsOpenProfileFromMem((const void*) bufs[i], lens[i]);
+        if (!profiles[i]) ok = 0;
+        bpcArr[i] = bpc[i] ? TRUE : FALSE;
+        intArr[i] = intents[i];
+        adArr[i]  = adaptation[i];
+    }
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateExtendedTransform(
+            NULL, n, profiles, bpcArr, intArr, adArr,
+            NULL, 0, u16_format(inChans), u16_format(outChans),
+            cmsFLAGS_NOOPTIMIZE);
+    }
+    if (xform) {
+        cmsDoTransform(xform, in, out, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    for (uint32_t i = 0; i < n; i++) if (profiles[i]) cmsCloseProfile(profiles[i]);
+    free(profiles); free(bpcArr); free(intArr); free(adArr);
+    return ok;
+}
