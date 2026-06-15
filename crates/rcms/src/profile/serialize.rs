@@ -543,6 +543,7 @@ fn write_tag_body<W: ProfileWriter>(
         Tag::ColorantTable(entries) => write_colorant_table(w, entries),
         Tag::Cicp(c) => write_cicp(w, c),
         Tag::Curve(c) => write_curve(w, ty, c),
+        Tag::Vcgt(curves) => write_vcgt(w, curves),
         Tag::ProfileSequenceDesc(items) => write_pseq(w, items, version),
         Tag::ProfileSequenceId(items) => write_psid(w, items, version),
         Tag::Lut(lut) => write_lut(w, ty, lut),
@@ -780,6 +781,58 @@ fn write_curve_para<W: ProfileWriter>(w: &mut W, curve: &ToneCurve) -> Result<()
     w.write_u16(0)?; // reserved
     for &p in &segs[0].params[..n_params] {
         w.write_s15fixed16(p)?;
+    }
+    Ok(())
+}
+
+/// lcms2 `cmsVideoCardGammaTableType` / `cmsVideoCardGammaFormulaType` selectors
+/// (cmstypes.c:4929-4930), the leading u32 of a `vcgt` body.
+const VCGT_TABLE_TYPE: u32 = 0;
+const VCGT_FORMULA_TYPE: u32 = 1;
+
+/// `Type_vcgt_Write` (cmstypes.c:5079). The three R/G/B tone curves write as the
+/// FORMULA variant iff all three are lcms2 parametric type 5 (the form the
+/// `Type_vcgt_Read` formula path builds): a `cmsVideoCardGammaFormulaType` tag of
+/// three `(Gamma, Min, Max)` s15Fixed16 triples, with `Gamma = Params[0]`,
+/// `Min = Params[5]`, `Max = pow(Params[1], Gamma) + Min`. Otherwise it writes the
+/// TABLE variant: `cmsVideoCardGammaTableType`, `nChannels=3`, `nEntries=256`,
+/// `nBytes=2`, then each channel's 256 words sampled via
+/// `_cmsQuickSaturateWord(cmsEvalToneCurveFloat(c, j/255) * 65535)`.
+fn write_vcgt<W: ProfileWriter>(w: &mut W, curves: &[ToneCurve]) -> Result<()> {
+    if curves.len() != 3 {
+        return Err(Error::Unsupported("vcgt must have exactly 3 curves"));
+    }
+    let all_type5 = curves.iter().all(|c| {
+        let segs = c.segments();
+        segs.len() == 1 && segs[0].seg_type == 5
+    });
+
+    if all_type5 {
+        w.write_u32(VCGT_FORMULA_TYPE)?;
+        for c in curves {
+            let p = &c.segments()[0].params;
+            let gamma = p[0];
+            let min = p[5];
+            let max = p[1].powf(gamma) + min;
+            w.write_s15fixed16(gamma)?;
+            w.write_s15fixed16(min)?;
+            w.write_s15fixed16(max)?;
+        }
+        return Ok(());
+    }
+
+    // Always store as a table of 256 words per channel.
+    use crate::compat::floor::{FloorStrategy, Lcms2Floor};
+    w.write_u32(VCGT_TABLE_TYPE)?;
+    w.write_u16(3)?; // nChannels
+    w.write_u16(256)?; // nEntries
+    w.write_u16(2)?; // nBytes
+    for c in curves {
+        for j in 0..256u32 {
+            let v = c.eval_float(j as f32 / 255.0);
+            let n = Lcms2Floor::quick_saturate_word(v as f64 * 65535.0);
+            w.write_u16(n)?;
+        }
     }
     Ok(())
 }
