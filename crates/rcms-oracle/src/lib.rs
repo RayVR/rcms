@@ -72,6 +72,17 @@ unsafe extern "C" {
     fn rcms_oracle_save_basic_profile(link: i32, out: *mut u8, cap: u32) -> u32;
     fn rcms_oracle_save_single_tag(which: i32, out: *mut u8, cap: u32) -> u32;
     fn rcms_oracle_save_curve_mlu_tag(which: i32, out: *mut u8, cap: u32) -> u32;
+    fn rcms_oracle_resave_lut_tag(
+        src: *const u8,
+        len: u32,
+        src_sig: u32,
+        dst_sig: u32,
+        version: f64,
+        save_as_8bit: i32,
+        out: *mut u8,
+        cap: u32,
+    ) -> u32;
+    fn rcms_oracle_save_mpe_tag(out: *mut u8, cap: u32) -> u32;
     fn rcms_oracle_tetra16(
         grid: *const u32,
         n_out: u32,
@@ -2934,6 +2945,79 @@ pub fn save_curve_mlu_tag(which: i32) -> Option<Vec<u8>> {
     // SAFETY: `out` has exactly `needed` bytes; C writes at most `cap` and bails
     // if needed > cap, returning the count written.
     let written = unsafe { rcms_oracle_save_curve_mlu_tag(which, out.as_mut_ptr(), needed) };
+    if written == 0 {
+        return None;
+    }
+    out.truncate(written as usize);
+    Some(out)
+}
+
+/// lcms2 reads the pipeline tag `src_sig` from the source profile bytes `src`,
+/// then re-serializes that parsed pipeline into a fresh deterministic-header
+/// profile (version `version`) under `dst_sig` via `cmsWriteTag` +
+/// `cmsSaveProfileToMem`. When `save_as_8bit` is true the pipeline's
+/// `SaveAs8Bits` flag is forced on (to drive the mft1/LUT8 path). Returns the
+/// whole-profile bytes, or `None` on failure. rcms parses the same bytes and
+/// builds the identical structure; the two serializations must match.
+pub fn resave_lut_tag(
+    src: &[u8],
+    src_sig: u32,
+    dst_sig: u32,
+    version: f64,
+    save_as_8bit: bool,
+) -> Option<Vec<u8>> {
+    let len = u32::try_from(src.len()).ok()?;
+    // SAFETY: out=NULL size query; C reads `src[..len]` and returns the length.
+    let needed = unsafe {
+        rcms_oracle_resave_lut_tag(
+            src.as_ptr(),
+            len,
+            src_sig,
+            dst_sig,
+            version,
+            save_as_8bit as i32,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; needed as usize];
+    // SAFETY: `out` has exactly `needed` bytes; C writes at most `cap` and bails
+    // if needed > cap, returning the count written.
+    let written = unsafe {
+        rcms_oracle_resave_lut_tag(
+            src.as_ptr(),
+            len,
+            src_sig,
+            dst_sig,
+            version,
+            save_as_8bit as i32,
+            out.as_mut_ptr(),
+            needed,
+        )
+    };
+    if written == 0 {
+        return None;
+    }
+    out.truncate(written as usize);
+    Some(out)
+}
+
+/// lcms2 builds a small synthetic MPE pipeline (curve-set → matrix → float CLUT),
+/// writes it under `cmsSigDToB0Tag` at v4.4, and serializes the whole profile.
+/// rcms constructs the identical pipeline; the bytes must match. Exercises the
+/// `mpet` writer body. Returns the whole-profile bytes, or `None` on failure.
+pub fn save_mpe_tag() -> Option<Vec<u8>> {
+    // SAFETY: out=NULL size query; C returns the required length.
+    let needed = unsafe { rcms_oracle_save_mpe_tag(core::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; needed as usize];
+    // SAFETY: `out` has exactly `needed` bytes; C writes at most `cap`.
+    let written = unsafe { rcms_oracle_save_mpe_tag(out.as_mut_ptr(), needed) };
     if written == 0 {
         return None;
     }

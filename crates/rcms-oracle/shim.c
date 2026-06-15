@@ -2129,6 +2129,102 @@ uint32_t rcms_oracle_save_curve_mlu_tag(int which, uint8_t* out, uint32_t cap) {
     return rcms_oracle_finish_save(h, out, cap);
 }
 
+/* ---- LUT/MPE tag-body re-serializer oracle (slice 7 T3) ------------------
+   Read the pipeline tag `src_sig` from the in-memory source profile `src`/`len`
+   (a real testbed profile carrying mft1/mft2/mAB/mBA), then build a fresh
+   placeholder with the deterministic header at version `version`, write that
+   SAME parsed pipeline under `dst_sig` via cmsWriteTag (so lcms2 re-serializes
+   the parsed structure, not a raw copy), and save. When `save_as_8bit != 0` the
+   pipeline's SaveAs8Bits flag is forced on (to exercise the mft1/LUT8 path,
+   which a fresh read never selects). rcms builds the identical WritableProfile
+   from its own parse of the same bytes; the whole-profile bytes must match. */
+uint32_t rcms_oracle_resave_lut_tag(const uint8_t* src, uint32_t len,
+                                    uint32_t src_sig, uint32_t dst_sig,
+                                    double version, int save_as_8bit,
+                                    uint8_t* out, uint32_t cap) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*) src, len);
+    if (!p) return 0;
+
+    cmsPipeline* lut = (cmsPipeline*) cmsReadTag(p, (cmsTagSignature) src_sig);
+    if (lut == NULL) { cmsCloseProfile(p); return 0; }
+
+    /* Duplicate so the pipeline survives closing the source profile. */
+    cmsPipeline* dup = cmsPipelineDup(lut);
+    cmsCloseProfile(p);
+    if (dup == NULL) return 0;
+
+    if (save_as_8bit) cmsPipelineSetSaveAs8bitsFlag(dup, TRUE);
+
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) { cmsPipelineFree(dup); return 0; }
+    rcms_oracle_set_fixed_header(h);
+    cmsSetProfileVersion(h, version);
+
+    if (!cmsWriteTag(h, (cmsTagSignature) dst_sig, dup)) {
+        cmsPipelineFree(dup);
+        cmsCloseProfile(h);
+        return 0;
+    }
+    cmsPipelineFree(dup);
+
+    return rcms_oracle_finish_save(h, out, cap);
+}
+
+/* Build a small synthetic MPE pipeline (curve-set -> matrix -> float CLUT),
+   write it under cmsSigDToB0Tag at v4.4, and serialize. rcms constructs the
+   identical pipeline; the bytes must match. This exercises the mpet body when
+   no testbed profile carries a valid multiProcessElements tag. */
+uint32_t rcms_oracle_save_mpe_tag(uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) return 0;
+    rcms_oracle_set_fixed_header(h);
+    cmsSetProfileVersion(h, 4.4);
+
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, 3, 3);
+    if (!lut) { cmsCloseProfile(h); return 0; }
+
+    /* Curve-set: three segmented curves, each one formula segment of type 0
+       (lcms2 internal Type 6: Y = (a*X + b)^g + c) spanning the whole domain.
+       MPE WriteSegmentedCurve only allows formula types 0/1/2 (stored Type-6),
+       so this is the simplest curve that round-trips through the MPE writer. */
+    cmsCurveSegment seg;
+    memset(&seg, 0, sizeof(seg));
+    seg.x0 = -1e22f;
+    seg.x1 = 1e22f;
+    seg.Type = 6;           /* formula type 0 on disk */
+    seg.Params[0] = 1.0;    /* g */
+    seg.Params[1] = 1.0;    /* a */
+    seg.Params[2] = 0.0;    /* b */
+    seg.Params[3] = 0.0;    /* c */
+    cmsToneCurve* g[3];
+    g[0] = cmsBuildSegmentedToneCurve(NULL, 1, &seg);
+    g[1] = cmsBuildSegmentedToneCurve(NULL, 1, &seg);
+    g[2] = cmsBuildSegmentedToneCurve(NULL, 1, &seg);
+    cmsPipelineInsertStage(lut, cmsAT_END, cmsStageAllocToneCurves(NULL, 3, g));
+    cmsFreeToneCurveTriple(g);
+
+    /* Matrix 3x3 with offset. */
+    static const cmsFloat64Number mat[9] = {
+        1.1, 0.0, 0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 1.05
+    };
+    static const cmsFloat64Number off[3] = { 0.01, -0.02, 0.03 };
+    cmsPipelineInsertStage(lut, cmsAT_END, cmsStageAllocMatrix(NULL, 3, 3, mat, off));
+
+    /* Float CLUT, 2 points per dimension, 3->3. */
+    cmsUInt32Number grid[3] = { 2, 2, 2 };
+    cmsPipelineInsertStage(lut, cmsAT_END,
+        cmsStageAllocCLutFloatGranular(NULL, grid, 3, 3, NULL));
+
+    if (!cmsWriteTag(h, cmsSigDToB0Tag, lut)) {
+        cmsPipelineFree(lut);
+        cmsCloseProfile(h);
+        return 0;
+    }
+    cmsPipelineFree(lut);
+
+    return rcms_oracle_finish_save(h, out, cap);
+}
+
 /* Returns bytes written (>0) on success, or 0 on failure. If out==NULL just
    returns the required length (size query). link!=0 links gXYZ/bXYZ to rXYZ. */
 uint32_t rcms_oracle_save_basic_profile(int link, uint8_t* out, uint32_t cap) {

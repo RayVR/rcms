@@ -24,6 +24,18 @@ pub trait ProfileWriter {
     /// Tag offsets and alignment padding are computed from this.
     fn position(&self) -> usize;
 
+    /// Back-patch a big-endian u32 at a previously recorded position (lcms2's
+    /// `Seek(pos)` + `_cmsWriteUInt32Number` + `Seek(end)` dance in the
+    /// `mAB`/`mBA`/`mpet` writers, which emit an offset directory ahead of the
+    /// blocks it points at). Overwrites bytes already written — it never changes
+    /// the total length — so on the counting pass it is a correct no-op (the
+    /// default), and on [`MemWriter`] it overwrites in place. Errors via
+    /// [`crate::error::Error::Range`] if `pos + 4` exceeds what was written.
+    fn patch_u32(&mut self, pos: usize, v: u32) -> Result<()> {
+        let _ = (pos, v);
+        Ok(())
+    }
+
     fn write_u8(&mut self, v: u8) -> Result<()> {
         self.write_all(&[v])
     }
@@ -35,6 +47,12 @@ pub trait ProfileWriter {
     }
     fn write_u64(&mut self, v: u64) -> Result<()> {
         self.write_all(&v.to_be_bytes())
+    }
+
+    /// lcms2 `_cmsWriteFloat32Number` (`cmsplugin.c:309`): reinterpret the `f32`'s
+    /// bits as a u32 and write big-endian (the union punning + `_cmsAdjustEndianess32`).
+    fn write_f32(&mut self, v: f32) -> Result<()> {
+        self.write_u32(v.to_bits())
     }
 
     /// lcms2 `_cmsWrite15Fixed16Number` (`cmsplugin.c:337`): `_cmsDoubleTo15Fixed16`
@@ -89,22 +107,6 @@ impl MemWriter {
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf
     }
-
-    /// Back-patch a big-endian u32 at a previously recorded byte position. lcms2's
-    /// `mAB`/`mBA`/`mluc` writers emit an offset directory pointing at blocks
-    /// written afterward; they record the directory slot's position, write the
-    /// blocks, then seek back and overwrite the placeholder with the real offset.
-    /// Mirrors a `Seek(pos)` + `Write(u32)` on the underlying IOhandler. Errors
-    /// (via `Error::Range`) if `pos + 4` exceeds the buffer.
-    pub fn patch_u32(&mut self, pos: usize, v: u32) -> Result<()> {
-        let end = pos.checked_add(4).ok_or(crate::error::Error::Range)?;
-        let slot = self
-            .buf
-            .get_mut(pos..end)
-            .ok_or(crate::error::Error::Range)?;
-        slot.copy_from_slice(&v.to_be_bytes());
-        Ok(())
-    }
 }
 impl ProfileWriter for MemWriter {
     fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
@@ -113,6 +115,22 @@ impl ProfileWriter for MemWriter {
     }
     fn position(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Back-patch a big-endian u32 at a previously recorded byte position. lcms2's
+    /// `mAB`/`mBA`/`mpet` writers emit an offset directory pointing at blocks
+    /// written afterward; they record the directory slot's position, write the
+    /// blocks, then seek back and overwrite the placeholder with the real offset.
+    /// Mirrors a `Seek(pos)` + `Write(u32)` on the underlying IOhandler. Errors
+    /// (via `Error::Range`) if `pos + 4` exceeds the buffer.
+    fn patch_u32(&mut self, pos: usize, v: u32) -> Result<()> {
+        let end = pos.checked_add(4).ok_or(crate::error::Error::Range)?;
+        let slot = self
+            .buf
+            .get_mut(pos..end)
+            .ok_or(crate::error::Error::Range)?;
+        slot.copy_from_slice(&v.to_be_bytes());
+        Ok(())
     }
 }
 

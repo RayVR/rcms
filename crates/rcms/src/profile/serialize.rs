@@ -44,6 +44,8 @@ use crate::curve::ToneCurve;
 use crate::error::{Error, Result};
 use crate::fixed::U8Fixed8;
 use crate::io::{CountWriter, MemWriter, ProfileWriter};
+use crate::pipeline::clut::ClutTable;
+use crate::pipeline::{Pipeline, Stage};
 use crate::profile::header::{DateTime, Header};
 use crate::profile::tag::{
     Cicp, ColorantTableEntry, Measurement, Mlu, ProfileSequenceItem, Tag, ViewingConditions,
@@ -302,7 +304,9 @@ const SIG_VIEWING_COND_TYPE: Signature = Signature::from_raw(0x76696577); // 'vi
 const SIG_COLORANT_TABLE_TYPE: Signature = Signature::from_raw(0x636C_7274); // 'clrt'
 const SIG_CICP_TYPE: Signature = Signature::from_raw(0x6369_6370); // 'cicp'
 const SIG_VCGT_TYPE: Signature = Signature::from_raw(0x7663_6774); // 'vcgt'
+const SIG_LUT8_TYPE: Signature = Signature::from_raw(0x6D667431); // 'mft1'
 const SIG_LUT16_TYPE: Signature = Signature::from_raw(0x6D667432); // 'mft2'
+const SIG_MPE_TYPE: Signature = Signature::from_raw(0x6D706574); // 'mpet'
 const SIG_LUT_ATOB_TYPE: Signature = Signature::from_raw(0x6D414220); // 'mAB '
 const SIG_LUT_BTOA_TYPE: Signature = Signature::from_raw(0x6D424120); // 'mBA '
 const SIG_CURVE_TYPE: Signature = Signature::from_raw(0x6375_7276); // 'curv'
@@ -327,6 +331,16 @@ const TAG_GAMUT: Signature = Signature::from_bytes(*b"gamt");
 const TAG_PREVIEW0: Signature = Signature::from_bytes(*b"pre0");
 const TAG_PREVIEW1: Signature = Signature::from_bytes(*b"pre1");
 const TAG_PREVIEW2: Signature = Signature::from_bytes(*b"pre2");
+// The DToB*/BToD* tags carry a multiProcessElements pipeline (descriptor
+// `SupportedTypes[0] = cmsSigMultiProcessElementType`, no decider).
+const TAG_DTOB0: Signature = Signature::from_bytes(*b"D2B0");
+const TAG_DTOB1: Signature = Signature::from_bytes(*b"D2B1");
+const TAG_DTOB2: Signature = Signature::from_bytes(*b"D2B2");
+const TAG_DTOB3: Signature = Signature::from_bytes(*b"D2B3");
+const TAG_BTOD0: Signature = Signature::from_bytes(*b"B2D0");
+const TAG_BTOD1: Signature = Signature::from_bytes(*b"B2D1");
+const TAG_BTOD2: Signature = Signature::from_bytes(*b"B2D2");
+const TAG_BTOD3: Signature = Signature::from_bytes(*b"B2D3");
 
 /// lcms2 `BaseToBase(in, BaseIn, BaseOut)` (cmsio0.c:1209): reinterpret `in`'s
 /// `BaseIn` digits as `BaseOut` digits. `cmsGetProfileVersion` uses
@@ -458,6 +472,20 @@ fn decide_curve(curve: &ToneCurve, version: f64) -> Signature {
 /// `SaveAs8Bits` flag (resolved in T3). The bodies are T3; this only fixes the
 /// type signature so the dispatch table is complete.
 fn decide_lut(sig: Signature, version: f64) -> Signature {
+    // The DToB*/BToD* tags always serialize as multiProcessElements (no decider).
+    if matches!(
+        sig,
+        TAG_DTOB0
+            | TAG_DTOB1
+            | TAG_DTOB2
+            | TAG_DTOB3
+            | TAG_BTOD0
+            | TAG_BTOD1
+            | TAG_BTOD2
+            | TAG_BTOD3
+    ) {
+        return SIG_MPE_TYPE;
+    }
     let is_a2b = matches!(sig, TAG_ATOB0 | TAG_ATOB1 | TAG_ATOB2);
     let is_b2a = matches!(
         sig,
@@ -510,7 +538,23 @@ fn write_tag_body<W: ProfileWriter>(
         Tag::Cicp(c) => write_cicp(w, c),
         Tag::Curve(c) => write_curve(w, ty, c),
         Tag::ProfileSequenceDesc(items) => write_pseq(w, items, version),
+        Tag::Lut(lut) => write_lut(w, ty, lut),
         _ => Err(Error::Unsupported("tag type writer not yet implemented")),
+    }
+}
+
+/// Dispatch a LUT/pipeline body by the type `DecideLUTtype{A2B,B2A}` selected:
+/// `mft1` (LUT8), `mft2` (LUT16), `mAB ` (LutAtoB), `mBA ` (LutBtoA), or `mpet`
+/// (multi-process elements). Each writer disassembles the parsed [`Pipeline`]
+/// back into the on-disk structure exactly as its `Type_*_Write` does.
+fn write_lut<W: ProfileWriter>(w: &mut W, ty: Signature, lut: &Pipeline) -> Result<()> {
+    match ty {
+        SIG_LUT8_TYPE => write_lut8(w, lut),
+        SIG_LUT16_TYPE => write_lut16(w, lut),
+        SIG_LUT_ATOB_TYPE => write_lut_a2b(w, lut),
+        SIG_LUT_BTOA_TYPE => write_lut_b2a(w, lut),
+        SIG_MPE_TYPE => write_mpe(w, lut),
+        _ => Err(Error::Unsupported("unexpected LUT type signature")),
     }
 }
 
@@ -870,6 +914,801 @@ fn write_embedded_description<W: ProfileWriter>(w: &mut W, mlu: &Mlu, version: f
         w.write_type_base(SIG_MLUC_TYPE)?;
         write_mlu(w, mlu)
     }
+}
+
+// ---- T3: LUT / MPE tag-body writers (cmstypes.c) ----
+
+/// lcms2 `FROM_16_TO_8(rgb)` (lcms2_internal.h:126): the round-to-8-bit reduction
+/// `((rgb * 65281 + 8388608) >> 24) & 0xFF`.
+fn from_16_to_8(v: u16) -> u8 {
+    (((v as u32 * 65281 + 8_388_608) >> 24) & 0xFF) as u8
+}
+
+/// lcms2 `Write8bitTables` (cmstypes.c:1936): for each of `n` channels, write a
+/// 256-entry 8-bit table. The identity special case — a 2-entry table `{0,
+/// 65535}` — is written as the linear ramp `0..256`; otherwise the curve MUST
+/// have exactly 256 entries (lcms2 errors otherwise), each reduced via
+/// `FROM_16_TO_8`. `curves` is `None` for a missing stage (the C `Tables ==
+/// NULL`), in which case nothing is written.
+fn write_8bit_tables<W: ProfileWriter>(
+    w: &mut W,
+    n: usize,
+    curves: Option<&[ToneCurve]>,
+) -> Result<()> {
+    let Some(curves) = curves else {
+        return Ok(());
+    };
+    for curve in curves.iter().take(n) {
+        let table = curve.table16();
+        if table.len() == 2 && table[0] == 0 && table[1] == 65535 {
+            // Usual identity curve: the literal ramp j = 0..256.
+            for j in 0..256u32 {
+                w.write_u8(j as u8)?;
+            }
+        } else if table.len() != 256 {
+            return Err(Error::Unsupported(
+                "LUT8 needs 256 entries on linearization",
+            ));
+        } else {
+            for &v in table {
+                w.write_u8(from_16_to_8(v))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// lcms2 `Write16bitTables` (cmstypes.c:2283): write every channel's full
+/// `nEntries` u16 table verbatim, back-to-back.
+fn write_16bit_tables<W: ProfileWriter>(w: &mut W, curves: &[ToneCurve]) -> Result<()> {
+    for curve in curves {
+        for &v in curve.table16() {
+            w.write_u16(v)?;
+        }
+    }
+    Ok(())
+}
+
+/// Borrow the curve set of a [`Stage::ToneCurves`], or `None` for any other stage.
+fn as_tone_curves(stage: &Stage) -> Option<&[ToneCurve]> {
+    match stage {
+        Stage::ToneCurves(curves) => Some(curves),
+        _ => None,
+    }
+}
+
+/// A borrowed [`Stage::Matrix`] disassembled into `(rows, cols, m, offset)` — the
+/// shape the LUT/MPE matrix-block writers consume.
+type MatrixRef<'a> = (usize, usize, &'a [f64], Option<&'a [f64]>);
+
+/// Borrow `(rows, cols, m, offset)` of a [`Stage::Matrix`], or `None` otherwise.
+fn as_matrix(stage: &Stage) -> Option<MatrixRef<'_>> {
+    match stage {
+        Stage::Matrix {
+            rows,
+            cols,
+            m,
+            offset,
+        } => Some((*rows, *cols, m, offset.as_deref())),
+        _ => None,
+    }
+}
+
+/// Borrow the CLUT of a [`Stage::Clut`], or `None` otherwise.
+fn as_clut(stage: &Stage) -> Option<&crate::pipeline::Clut> {
+    match stage {
+        Stage::Clut(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// lcms2 `Type_LUT8_Write` (cmstypes.c:2105). Disassemble the pipeline into the
+/// fixed `[Matrix?] -> PreCurves? -> CLUT? -> PostCurves?` shape, then write the
+/// LUT8 header (in/out/grid/pad), a 9-entry s15Fixed16 matrix (identity when
+/// absent), the always-256-entry 8-bit input tables, the 8-bit CLUT, and the
+/// 256-entry 8-bit output tables.
+fn write_lut8<W: ProfileWriter>(w: &mut W, lut: &Pipeline) -> Result<()> {
+    let (mat, pre, clut, post) = disassemble_lut(lut)?;
+
+    let input_channels = lut.input_channels;
+    let output_channels = lut.output_channels;
+
+    // Lut8 requires uniform CLUT grid; clutPoints = nSamples[0] (0 when no CLUT).
+    let clut_points = uniform_clut_points(clut, input_channels)?;
+
+    w.write_u8(u8::try_from(input_channels).map_err(|_| Error::Range)?)?;
+    w.write_u8(u8::try_from(output_channels).map_err(|_| Error::Range)?)?;
+    w.write_u8(u8::try_from(clut_points).map_err(|_| Error::Range)?)?;
+    w.write_u8(0)?; // padding
+
+    write_lut_matrix(w, mat)?;
+
+    write_8bit_tables(w, input_channels, pre)?;
+
+    if let Some(clut) = clut {
+        if clut_points > 0 {
+            let table = clut_u16(clut)?;
+            for &v in table {
+                w.write_u8(from_16_to_8(v))?;
+            }
+        }
+    }
+
+    write_8bit_tables(w, output_channels, post)?;
+    Ok(())
+}
+
+/// lcms2 `Type_LUT16_Write` (cmstypes.c:2399). Like [`write_lut8`] but writes the
+/// input/output table lengths (the curves' `nEntries`, default 2 when a stage is
+/// absent) and 16-bit tables/CLUT. A missing pre/post curve set is written as the
+/// default identity `{0, 0xFFFF}` ramp per channel.
+fn write_lut16<W: ProfileWriter>(w: &mut W, lut: &Pipeline) -> Result<()> {
+    let (mat, pre, clut, post) = disassemble_lut(lut)?;
+
+    let input_channels = lut.input_channels;
+    let output_channels = lut.output_channels;
+    let clut_points = uniform_clut_points(clut, input_channels)?;
+
+    w.write_u8(u8::try_from(input_channels).map_err(|_| Error::Range)?)?;
+    w.write_u8(u8::try_from(output_channels).map_err(|_| Error::Range)?)?;
+    w.write_u8(u8::try_from(clut_points).map_err(|_| Error::Range)?)?;
+    w.write_u8(0)?; // padding
+
+    write_lut_matrix(w, mat)?;
+
+    // Input/output table entry counts: the curve's nEntries, or 2 when absent.
+    let in_entries = pre.map(|c| c[0].table16().len()).unwrap_or(2);
+    let out_entries = post.map(|c| c[0].table16().len()).unwrap_or(2);
+    w.write_u16(u16::try_from(in_entries).map_err(|_| Error::Range)?)?;
+    w.write_u16(u16::try_from(out_entries).map_err(|_| Error::Range)?)?;
+
+    // Prelinearization tables (default identity {0, 0xFFFF} per channel).
+    match pre {
+        Some(curves) => write_16bit_tables(w, curves)?,
+        None => {
+            for _ in 0..input_channels {
+                w.write_u16(0)?;
+                w.write_u16(0xFFFF)?;
+            }
+        }
+    }
+
+    if let Some(clut) = clut {
+        if clut_points > 0 {
+            let table = clut_u16(clut)?;
+            for &v in table {
+                w.write_u16(v)?;
+            }
+        }
+    }
+
+    match post {
+        Some(curves) => write_16bit_tables(w, curves)?,
+        None => {
+            for _ in 0..output_channels {
+                w.write_u16(0)?;
+                w.write_u16(0xFFFF)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Disassemble a LUT8/LUT16 pipeline into `(matrix?, pre-curves?, clut?,
+/// post-curves?)`, mirroring the C walk: an optional leading 3x3 `Matrix`, an
+/// optional `ToneCurves`, an optional `Clut`, an optional `ToneCurves`. Any other
+/// shape is rejected (lcms2 "LUT is not suitable to be saved as LUT8/16").
+#[allow(clippy::type_complexity)]
+fn disassemble_lut(
+    lut: &Pipeline,
+) -> Result<(
+    Option<MatrixRef<'_>>,
+    Option<&[ToneCurve]>,
+    Option<&crate::pipeline::Clut>,
+    Option<&[ToneCurve]>,
+)> {
+    let stages = lut.stages();
+    let mut i = 0;
+    let mut mat = None;
+    let mut pre = None;
+    let mut clut = None;
+    let mut post = None;
+
+    if i < stages.len() {
+        if let Some((rows, cols, m, off)) = as_matrix(&stages[i]) {
+            if rows != 3 || cols != 3 {
+                return Err(Error::Unsupported("LUT matrix is not 3x3"));
+            }
+            mat = Some((rows, cols, m, off));
+            i += 1;
+        }
+    }
+    if i < stages.len() {
+        if let Some(c) = as_tone_curves(&stages[i]) {
+            pre = Some(c);
+            i += 1;
+        }
+    }
+    if i < stages.len() {
+        if let Some(c) = as_clut(&stages[i]) {
+            clut = Some(c);
+            i += 1;
+        }
+    }
+    if i < stages.len() {
+        if let Some(c) = as_tone_curves(&stages[i]) {
+            post = Some(c);
+            i += 1;
+        }
+    }
+    if i != stages.len() {
+        return Err(Error::Unsupported(
+            "LUT not suitable to be saved as mft1/mft2",
+        ));
+    }
+    Ok((mat, pre, clut, post))
+}
+
+/// The uniform CLUT grid-point count for LUT8/LUT16 (`clut->Params->nSamples[0]`),
+/// or 0 when there is no CLUT. lcms2 rejects a CLUT whose per-dimension sample
+/// counts are not all equal (it cannot encode a non-uniform grid in mft1/mft2).
+fn uniform_clut_points(clut: Option<&crate::pipeline::Clut>, input_channels: usize) -> Result<u32> {
+    let Some(clut) = clut else {
+        return Ok(0);
+    };
+    let n = &clut.params.n_samples;
+    let points = n[0];
+    if n.iter().take(input_channels).skip(1).any(|&s| s != points) {
+        return Err(Error::Unsupported(
+            "LUT with non-uniform CLUT samples cannot be saved as mft1/mft2",
+        ));
+    }
+    Ok(points)
+}
+
+/// Borrow a CLUT's 16-bit table, rejecting a float CLUT (mft1/mft2/mAB/mBA store
+/// 8- or 16-bit samples only — lcms2 `WriteCLUT` "Cannot save floating point").
+fn clut_u16(clut: &crate::pipeline::Clut) -> Result<&[u16]> {
+    match &clut.table {
+        ClutTable::U16(t) => Ok(t),
+        ClutTable::F32(_) => Err(Error::Unsupported(
+            "cannot save a float CLUT as mft/mAB/mBA",
+        )),
+    }
+}
+
+/// Write the 9-entry s15Fixed16 LUT8/LUT16 matrix, or the identity matrix when no
+/// matrix stage is present (cmstypes.c:2168-2189 / 2461-2482).
+fn write_lut_matrix<W: ProfileWriter>(w: &mut W, mat: Option<MatrixRef<'_>>) -> Result<()> {
+    match mat {
+        Some((_, _, m, _)) => {
+            for &v in &m[..9] {
+                w.write_s15fixed16(v)?;
+            }
+        }
+        None => {
+            const IDENTITY: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+            for v in IDENTITY {
+                w.write_s15fixed16(v)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// lcms2 `WriteMatrix` (cmstypes.c:2812): the `InputChannels * OutputChannels`
+/// s15Fixed16 matrix entries, then `OutputChannels` offset entries (zeros when the
+/// stage carries no offset).
+fn write_matrix_block<W: ProfileWriter>(
+    w: &mut W,
+    rows: usize,
+    cols: usize,
+    m: &[f64],
+    offset: Option<&[f64]>,
+) -> Result<()> {
+    for &v in &m[..rows * cols] {
+        w.write_s15fixed16(v)?;
+    }
+    match offset {
+        Some(off) => {
+            for &v in &off[..rows] {
+                w.write_s15fixed16(v)?;
+            }
+        }
+        None => {
+            for _ in 0..rows {
+                w.write_s15fixed16(0.0)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// lcms2 `WriteSetOfCurves` (cmstypes.c:2849): write each of the stage's curves as
+/// `type-base + body + alignment`. The base type is `para`, downgraded to `curv`
+/// for a tabulated curve (no segments), a float-tabulated curve (3 segments with a
+/// sampled middle), or an inverted first segment (`Type < 0`).
+fn write_set_of_curves<W: ProfileWriter>(w: &mut W, curves: &[ToneCurve]) -> Result<()> {
+    for curve in curves {
+        let segs = curve.segments();
+        let use_curv = segs.is_empty()
+            || (segs.len() == 3 && segs[1].seg_type == 0)
+            || (!segs.is_empty() && segs[0].seg_type < 0);
+        if use_curv {
+            w.write_type_base(SIG_CURVE_TYPE)?;
+            write_curve_curv(w, curve)?;
+        } else {
+            w.write_type_base(SIG_PARAMETRIC_TYPE)?;
+            write_curve_para(w, curve)?;
+        }
+        w.write_alignment()?;
+    }
+    Ok(())
+}
+
+/// lcms2 `WriteCLUT` (cmstypes.c:2902): the 16-byte `gridPoints` array (per-input
+/// sample count, zero-padded), a 1-byte precision (1 = 8-bit, 2 = 16-bit) + 3 pad,
+/// the CLUT samples at that precision, then alignment. `precision` is the parsed
+/// pipeline's `SaveAs8Bits` choice — rcms always stores a 16-bit table, so the
+/// reader-produced pipelines round-trip at precision 2.
+fn write_clut_block<W: ProfileWriter>(
+    w: &mut W,
+    clut: &crate::pipeline::Clut,
+    precision: u8,
+) -> Result<()> {
+    let table = clut_u16(clut)?;
+
+    let mut grid_points = [0u8; 16];
+    for (slot, &n) in grid_points
+        .iter_mut()
+        .zip(clut.params.n_samples.iter())
+        .take(clut.params.n_inputs)
+    {
+        *slot = u8::try_from(n).map_err(|_| Error::Range)?;
+    }
+    w.write_all(&grid_points)?;
+
+    w.write_u8(precision)?;
+    w.write_u8(0)?;
+    w.write_u8(0)?;
+    w.write_u8(0)?;
+
+    match precision {
+        1 => {
+            for &v in table {
+                w.write_u8(from_16_to_8(v))?;
+            }
+        }
+        2 => {
+            for &v in table {
+                w.write_u16(v)?;
+            }
+        }
+        _ => return Err(Error::Unsupported("unknown CLUT precision")),
+    }
+
+    w.write_alignment()
+}
+
+/// lcms2 `Type_LUTA2B_Write` (cmstypes.c:2953). Disassemble the pipeline into the
+/// `{A, CLUT, M, Matrix, B}` roles (per the accepted A2B stage sequences), write
+/// the in/out channel header + a u16 pad, a five-entry placeholder offset
+/// directory, then the present blocks in `A, CLUT, M, Matrix, B` order recording
+/// each block's type-base-relative offset, and finally back-patch the directory
+/// (field order `B, Matrix, M, CLUT, A`).
+fn write_lut_a2b<W: ProfileWriter>(w: &mut W, lut: &Pipeline) -> Result<()> {
+    let roles = disassemble_a2b(lut)?;
+    write_mab_mba(w, lut, &roles)
+}
+
+/// lcms2 `Type_LUTB2A_Write` (cmstypes.c:3141). The B2A mirror of [`write_lut_a2b`]
+/// (the directory layout and block write order are identical; only the
+/// stage→role mapping differs, handled by [`disassemble_b2a`]).
+fn write_lut_b2a<W: ProfileWriter>(w: &mut W, lut: &Pipeline) -> Result<()> {
+    let roles = disassemble_b2a(lut)?;
+    write_mab_mba(w, lut, &roles)
+}
+
+/// The five optional blocks of an mAB/mBA tag, by role.
+#[derive(Default)]
+struct MabRoles<'a> {
+    a: Option<&'a [ToneCurve]>,
+    clut: Option<&'a crate::pipeline::Clut>,
+    m: Option<&'a [ToneCurve]>,
+    matrix: Option<MatrixRef<'a>>,
+    b: Option<&'a [ToneCurve]>,
+}
+
+/// Disassemble an A2B pipeline into `{A, CLUT, M, Matrix, B}` per the accepted
+/// stage sequences (cmstypes.c:2963-2972): `[B]`, `[M,Matrix,B]`, `[A,CLUT,B]`, or
+/// `[A,CLUT,M,Matrix,B]`. Any other shape is "not suitable to be saved as
+/// LutAToB".
+fn disassemble_a2b(lut: &Pipeline) -> Result<MabRoles<'_>> {
+    let s = lut.stages();
+    let mut r = MabRoles::default();
+    match s.len() {
+        1 => {
+            r.b = as_tone_curves(&s[0]);
+            check(r.b.is_some())?;
+        }
+        3 => {
+            // M, Matrix, B  OR  A, CLUT, B
+            if let Some(matrix) = as_matrix(&s[1]) {
+                r.m = as_tone_curves(&s[0]);
+                r.matrix = Some(matrix);
+                r.b = as_tone_curves(&s[2]);
+                check(r.m.is_some() && r.b.is_some())?;
+            } else {
+                r.a = as_tone_curves(&s[0]);
+                r.clut = as_clut(&s[1]);
+                r.b = as_tone_curves(&s[2]);
+                check(r.a.is_some() && r.clut.is_some() && r.b.is_some())?;
+            }
+        }
+        5 => {
+            r.a = as_tone_curves(&s[0]);
+            r.clut = as_clut(&s[1]);
+            r.m = as_tone_curves(&s[2]);
+            r.matrix = as_matrix(&s[3]);
+            r.b = as_tone_curves(&s[4]);
+            check(
+                r.a.is_some()
+                    && r.clut.is_some()
+                    && r.m.is_some()
+                    && r.matrix.is_some()
+                    && r.b.is_some(),
+            )?;
+        }
+        _ => {
+            return Err(Error::Unsupported(
+                "LUT not suitable to be saved as LutAToB",
+            ))
+        }
+    }
+    Ok(r)
+}
+
+/// Disassemble a B2A pipeline into `{A, CLUT, M, Matrix, B}` per the accepted
+/// stage sequences (cmstypes.c:3151-3160): `[B]`, `[B,Matrix,M]`, `[B,CLUT,A]`, or
+/// `[B,Matrix,M,CLUT,A]`. Note the reversed roles (B leads).
+fn disassemble_b2a(lut: &Pipeline) -> Result<MabRoles<'_>> {
+    let s = lut.stages();
+    let mut r = MabRoles::default();
+    match s.len() {
+        1 => {
+            r.b = as_tone_curves(&s[0]);
+            check(r.b.is_some())?;
+        }
+        3 => {
+            // B, Matrix, M  OR  B, CLUT, A
+            if let Some(matrix) = as_matrix(&s[1]) {
+                r.b = as_tone_curves(&s[0]);
+                r.matrix = Some(matrix);
+                r.m = as_tone_curves(&s[2]);
+                check(r.b.is_some() && r.m.is_some())?;
+            } else {
+                r.b = as_tone_curves(&s[0]);
+                r.clut = as_clut(&s[1]);
+                r.a = as_tone_curves(&s[2]);
+                check(r.b.is_some() && r.clut.is_some() && r.a.is_some())?;
+            }
+        }
+        5 => {
+            r.b = as_tone_curves(&s[0]);
+            r.matrix = as_matrix(&s[1]);
+            r.m = as_tone_curves(&s[2]);
+            r.clut = as_clut(&s[3]);
+            r.a = as_tone_curves(&s[4]);
+            check(
+                r.b.is_some()
+                    && r.matrix.is_some()
+                    && r.m.is_some()
+                    && r.clut.is_some()
+                    && r.a.is_some(),
+            )?;
+        }
+        _ => {
+            return Err(Error::Unsupported(
+                "LUT not suitable to be saved as LutBToA",
+            ))
+        }
+    }
+    Ok(r)
+}
+
+fn check(ok: bool) -> Result<()> {
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Unsupported("LUT stage shape mismatch"))
+    }
+}
+
+/// Shared mAB/mBA body writer (the two `Type_LUT{A2B,B2A}_Write` bodies are
+/// byte-identical once stages are mapped to roles). Writes in/out channels + a
+/// u16 pad, a five-u32 placeholder directory, the present blocks in
+/// `A, CLUT, M, Matrix, B` order (recording each type-base-relative offset), then
+/// back-patches the directory in `B, Matrix, M, CLUT, A` order.
+fn write_mab_mba<W: ProfileWriter>(w: &mut W, lut: &Pipeline, roles: &MabRoles) -> Result<()> {
+    // BaseOffset = Tell - sizeof(_cmsTagBase): the type base was written just
+    // before this body, so the current position is BaseOffset + 8.
+    let base_offset = w.position() - 8;
+
+    let input_channels = lut.input_channels;
+    let output_channels = lut.output_channels;
+
+    w.write_u8(u8::try_from(input_channels).map_err(|_| Error::Range)?)?;
+    w.write_u8(u8::try_from(output_channels).map_err(|_| Error::Range)?)?;
+    w.write_u16(0)?; // pad
+
+    // Placeholder directory (offsetB, offsetMat, offsetM, offsetC, offsetA).
+    let directory_pos = w.position();
+    for _ in 0..5 {
+        w.write_u32(0)?;
+    }
+
+    let mut offset_a = 0u32;
+    let mut offset_c = 0u32;
+    let mut offset_m = 0u32;
+    let mut offset_mat = 0u32;
+    let mut offset_b = 0u32;
+
+    if let Some(a) = roles.a {
+        offset_a = u32::try_from(w.position() - base_offset).map_err(|_| Error::Range)?;
+        write_set_of_curves(w, a)?;
+    }
+    if let Some(clut) = roles.clut {
+        offset_c = u32::try_from(w.position() - base_offset).map_err(|_| Error::Range)?;
+        // rcms stores a 16-bit table; reader-produced pipelines re-save at
+        // precision 2 (lcms2's SaveAs8Bits is never set when reading mAB/mBA).
+        write_clut_block(w, clut, 2)?;
+    }
+    if let Some(m) = roles.m {
+        offset_m = u32::try_from(w.position() - base_offset).map_err(|_| Error::Range)?;
+        write_set_of_curves(w, m)?;
+    }
+    if let Some((rows, cols, m, off)) = roles.matrix {
+        offset_mat = u32::try_from(w.position() - base_offset).map_err(|_| Error::Range)?;
+        write_matrix_block(w, rows, cols, m, off)?;
+    }
+    if let Some(b) = roles.b {
+        offset_b = u32::try_from(w.position() - base_offset).map_err(|_| Error::Range)?;
+        write_set_of_curves(w, b)?;
+    }
+
+    // Back-patch the directory (field order B, Matrix, M, CLUT, A).
+    w.patch_u32(directory_pos, offset_b)?;
+    w.patch_u32(directory_pos + 4, offset_mat)?;
+    w.patch_u32(directory_pos + 8, offset_m)?;
+    w.patch_u32(directory_pos + 12, offset_c)?;
+    w.patch_u32(directory_pos + 16, offset_a)?;
+    Ok(())
+}
+
+/// lcms2 `Type_MPE_Write` (cmstypes.c:4811). Writes in/out channels + a u32 element
+/// count, a per-element placeholder position table, each element (8-byte element
+/// base + body + alignment) recording its type-base-relative offset and size, then
+/// back-patches the position table.
+fn write_mpe<W: ProfileWriter>(w: &mut W, lut: &Pipeline) -> Result<()> {
+    let base_offset = w.position() - 8;
+    let stages = lut.stages();
+    let elem_count = stages.len();
+
+    w.write_u16(u16::try_from(lut.input_channels).map_err(|_| Error::Range)?)?;
+    w.write_u16(u16::try_from(lut.output_channels).map_err(|_| Error::Range)?)?;
+    w.write_u32(u32::try_from(elem_count).map_err(|_| Error::Range)?)?;
+
+    // Placeholder directory: (offset, size) per element.
+    let directory_pos = w.position();
+    for _ in 0..elem_count {
+        w.write_u32(0)?; // offset
+        w.write_u32(0)?; // size
+    }
+
+    let mut offsets = vec![0u32; elem_count];
+    let mut sizes = vec![0u32; elem_count];
+
+    for (i, stage) in stages.iter().enumerate() {
+        offsets[i] = u32::try_from(w.position() - base_offset).map_err(|_| Error::Range)?;
+        let before = w.position();
+        let sig = mpe_element_sig(stage)?;
+        w.write_u32(sig.to_raw())?;
+        w.write_u32(0)?; // reserved
+        write_mpe_element(w, stage)?;
+        w.write_alignment()?;
+        sizes[i] = u32::try_from(w.position() - before).map_err(|_| Error::Range)?;
+    }
+
+    for i in 0..elem_count {
+        w.patch_u32(directory_pos + i * 8, offsets[i])?;
+        w.patch_u32(directory_pos + i * 8 + 4, sizes[i])?;
+    }
+    Ok(())
+}
+
+/// The MPE element type signature for a stage (lcms2 `Elem->Type`):
+/// `ToneCurves` → `cvst`, `Matrix` → `matf`, `Clut` → `clut`.
+fn mpe_element_sig(stage: &Stage) -> Result<Signature> {
+    match stage {
+        Stage::ToneCurves(_) => Ok(SIG_MPE_CURVE_ELEM),
+        Stage::Matrix { .. } => Ok(SIG_MPE_MATRIX_ELEM),
+        Stage::Clut(_) => Ok(SIG_MPE_CLUT_ELEM),
+        _ => Err(Error::Unsupported(
+            "stage cannot be saved as an MPE element",
+        )),
+    }
+}
+
+/// Write one MPE element body (after its 8-byte element base): a curve-set
+/// (`Type_MPEcurve_Write`), a matrix (`Type_MPEmatrix_Write`), or a float CLUT
+/// (`Type_MPEclut_Write`).
+fn write_mpe_element<W: ProfileWriter>(w: &mut W, stage: &Stage) -> Result<()> {
+    match stage {
+        Stage::ToneCurves(curves) => write_mpe_curve(w, curves),
+        Stage::Matrix {
+            rows,
+            cols,
+            m,
+            offset,
+        } => write_mpe_matrix(w, *rows, *cols, m, offset.as_deref()),
+        Stage::Clut(clut) => write_mpe_clut(w, clut),
+        _ => Err(Error::Unsupported(
+            "stage cannot be saved as an MPE element",
+        )),
+    }
+}
+
+/// MPE element type signatures (`cmsSig{CurveSet,Matrix,CLut}ElemType`).
+const SIG_MPE_CURVE_ELEM: Signature = Signature::from_raw(0x6376_7374); // 'cvst'
+const SIG_MPE_MATRIX_ELEM: Signature = Signature::from_raw(0x6D61_7466); // 'matf'
+const SIG_MPE_CLUT_ELEM: Signature = Signature::from_raw(0x636C_7574); // 'clut'
+
+/// MPE segmented-curve on-disk signatures.
+const SIG_MPE_SEGMENTED_CURVE: u32 = 0x6375_7266; // 'curf'
+const SIG_MPE_FORMULA_SEG: u32 = 0x7061_7266; // 'parf'
+const SIG_MPE_SAMPLED_SEG: u32 = 0x7361_6D66; // 'samf'
+
+/// lcms2 `Type_MPEcurve_Write` (cmstypes.c:4486): InputChans (== OutputChans for a
+/// curve set), then a position table of one segmented curve per channel.
+fn write_mpe_curve<W: ProfileWriter>(w: &mut W, curves: &[ToneCurve]) -> Result<()> {
+    let base_offset = w.position() - 8;
+    let n = curves.len();
+
+    w.write_u16(u16::try_from(n).map_err(|_| Error::Range)?)?;
+    w.write_u16(u16::try_from(n).map_err(|_| Error::Range)?)?;
+
+    let directory_pos = w.position();
+    for _ in 0..n {
+        w.write_u32(0)?; // offset
+        w.write_u32(0)?; // size
+    }
+
+    let mut offsets = vec![0u32; n];
+    let mut sizes = vec![0u32; n];
+    for (i, curve) in curves.iter().enumerate() {
+        offsets[i] = u32::try_from(w.position() - base_offset).map_err(|_| Error::Range)?;
+        let before = w.position();
+        write_segmented_curve(w, curve)?;
+        sizes[i] = u32::try_from(w.position() - before).map_err(|_| Error::Range)?;
+    }
+
+    for i in 0..n {
+        w.patch_u32(directory_pos + i * 8, offsets[i])?;
+        w.patch_u32(directory_pos + i * 8 + 4, sizes[i])?;
+    }
+    Ok(())
+}
+
+/// lcms2 `WriteSegmentedCurve` (cmstypes.c:4405): the `cmsSigSegmentedCurve`
+/// wrapper, a reserved word, nSegments (u16), a reserved word, the `nSegments - 1`
+/// float32 break-points (each segment's `x1`), then each segment. A sampled
+/// segment is `samf` plus a count plus the `nGridPoints - 1` points after the
+/// implicit first; a formula segment is `parf` plus a type plus the type's
+/// float32 params. lcms2 stores `Segments[i].Type` as `ICCtype + 6` for formula
+/// segments, written back here as `Type - 6`.
+fn write_segmented_curve<W: ProfileWriter>(w: &mut W, curve: &ToneCurve) -> Result<()> {
+    let segs = curve.segments();
+    let n = segs.len();
+    if n == 0 {
+        return Err(Error::Unsupported(
+            "MPE segmented curve must have >= 1 segment",
+        ));
+    }
+
+    w.write_u32(SIG_MPE_SEGMENTED_CURVE)?;
+    w.write_u32(0)?; // reserved
+    w.write_u16(u16::try_from(n).map_err(|_| Error::Range)?)?;
+    w.write_u16(0)?; // reserved
+
+    // Break-points: Segments[i].x1 for i in 0..n-1.
+    for seg in &segs[..n - 1] {
+        w.write_f32(seg.x1)?;
+    }
+
+    const PARAMS_BY_TYPE: [usize; 3] = [4, 5, 5];
+    for seg in segs {
+        if seg.seg_type == 0 {
+            // Sampled segment: first point implicit, write count-1 then the rest.
+            let n_grid = seg.sampled.len();
+            w.write_u32(SIG_MPE_SAMPLED_SEG)?;
+            w.write_u32(0)?; // reserved
+            w.write_u32(
+                u32::try_from(n_grid)
+                    .map_err(|_| Error::Range)?
+                    .saturating_sub(1),
+            )?;
+            for &p in seg.sampled.iter().skip(1) {
+                w.write_f32(p)?;
+            }
+        } else {
+            // Formula segment: only ICC types 0..2 (stored type 6..8) are allowed.
+            let ty = seg.seg_type - 6;
+            if !(0..=2).contains(&ty) {
+                return Err(Error::Unsupported("MPE formula segment type out of range"));
+            }
+            w.write_u32(SIG_MPE_FORMULA_SEG)?;
+            w.write_u32(0)?; // reserved
+            w.write_u16(u16::try_from(ty).map_err(|_| Error::Range)?)?;
+            w.write_u16(0)?; // reserved
+            for &p in &seg.params[..PARAMS_BY_TYPE[ty as usize]] {
+                w.write_f32(p as f32)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// lcms2 `Type_MPEmatrix_Write` (cmstypes.c:4580): InputChans (u16), OutputChans
+/// (u16), the `InputChans * OutputChans` float32 matrix entries, then `OutputChans`
+/// float32 offsets (zeros when absent). The rcms `Matrix` stage is `cols -> rows`,
+/// so InputChans = cols and OutputChans = rows.
+fn write_mpe_matrix<W: ProfileWriter>(
+    w: &mut W,
+    rows: usize,
+    cols: usize,
+    m: &[f64],
+    offset: Option<&[f64]>,
+) -> Result<()> {
+    w.write_u16(u16::try_from(cols).map_err(|_| Error::Range)?)?; // InputChannels
+    w.write_u16(u16::try_from(rows).map_err(|_| Error::Range)?)?; // OutputChannels
+
+    for &v in &m[..rows * cols] {
+        w.write_f32(v as f32)?;
+    }
+    for i in 0..rows {
+        match offset {
+            Some(off) => w.write_f32(off[i] as f32)?,
+            None => w.write_f32(0.0)?,
+        }
+    }
+    Ok(())
+}
+
+/// lcms2 `Type_MPEclut_Write` (cmstypes.c:4665): InputChans (u16), OutputChans
+/// (u16), a 16-byte dimensions array (per-input sample count, zero-padded), then
+/// the float32 CLUT samples. MPE CLUTs are float-only (rcms `ClutTable::F32`).
+fn write_mpe_clut<W: ProfileWriter>(w: &mut W, clut: &crate::pipeline::Clut) -> Result<()> {
+    let ClutTable::F32(table) = &clut.table else {
+        return Err(Error::Unsupported("MPE CLUT must be float"));
+    };
+
+    w.write_u16(u16::try_from(clut.params.n_inputs).map_err(|_| Error::Range)?)?;
+    w.write_u16(u16::try_from(clut.params.n_outputs).map_err(|_| Error::Range)?)?;
+
+    let mut dims = [0u8; 16];
+    for (slot, &n) in dims
+        .iter_mut()
+        .zip(clut.params.n_samples.iter())
+        .take(clut.params.n_inputs)
+    {
+        *slot = u8::try_from(n).map_err(|_| Error::Range)?;
+    }
+    w.write_all(&dims)?;
+
+    for &v in table {
+        w.write_f32(v)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1555,5 +2394,239 @@ mod tests {
         assert_eq!(decide_curve(&table, 4.4), SIG_CURVE_TYPE);
         let para5 = build_parametric(5, &[2.4, 0.9, 0.1, 0.05, 0.1, 0.2, 0.3]).unwrap();
         assert_eq!(decide_curve(&para5, 4.4), SIG_PARAMETRIC_TYPE);
+    }
+
+    // ---- T3: mft1/mft2/mAB/mBA/mpet writers, diff-tested vs lcms2 ----
+
+    use crate::profile::Profile;
+
+    /// Load a testbed profile's bytes, read its `src_sig` pipeline tag, build a
+    /// `WritableProfile` (deterministic header at `version`) carrying that parsed
+    /// pipeline under `dst_sig`, serialize it, and assert byte-equality with lcms2
+    /// reading the SAME tag and re-serializing the same parsed pipeline. This
+    /// isolates the LUT body writers: both sides serialize the parsed structure
+    /// (lcms2 via `cmsWriteTag`, NOT a raw disk copy).
+    fn assert_lut_resave_identical(
+        testbed: &str,
+        src_sig: Signature,
+        dst_sig: Signature,
+        version: u32,
+        save_as_8bit: bool,
+        label: &str,
+    ) {
+        let path = format!(
+            "{}/../../vendor/Little-CMS/testbed/{testbed}.icc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{label}: read {path}: {e}"));
+
+        let prof = Profile::open(&bytes).expect("open testbed");
+        let tag = prof.read_tag(src_sig).expect("read LUT tag");
+        let lut = match tag {
+            Tag::Lut(p) => p,
+            other => panic!("{label}: expected Lut tag, got {other:?}"),
+        };
+
+        let mut p = WritableProfile::new(header_versioned(version));
+        p.add_tag(dst_sig, Tag::Lut(lut));
+        let rust = save_to_mem(&p).expect("rcms serialize");
+
+        let version_f = profile_version_float(version);
+        let c = rcms_oracle::resave_lut_tag(
+            &bytes,
+            src_sig.to_raw(),
+            dst_sig.to_raw(),
+            version_f,
+            save_as_8bit,
+        )
+        .expect("lcms2 resave");
+
+        assert_eq!(
+            rust.len(),
+            c.len(),
+            "{label}: length mismatch rcms={} lcms2={}",
+            rust.len(),
+            c.len()
+        );
+        if rust != c {
+            let first = rust.iter().zip(&c).position(|(a, b)| a != b);
+            panic!(
+                "{label}: byte mismatch at {first:?}\n rcms[..first+16]={:02x?}\n lcms[..first+16]={:02x?}",
+                &rust[..rust.len().min(first.unwrap_or(0) + 16)],
+                &c[..c.len().min(first.unwrap_or(0) + 16)],
+            );
+        }
+    }
+
+    const A2B0: Signature = Signature::from_bytes(*b"A2B0");
+    const B2A0: Signature = Signature::from_bytes(*b"B2A0");
+    const V2: u32 = 0x0230_0000;
+    const V4: u32 = 0x0440_0000;
+
+    /// `mft2` (LUT16): the test1 A2B0 16-bit LUT (matrix + curves + CLUT), parsed
+    /// and re-serialized at v2 (so DecideLUTtype picks mft2).
+    #[test]
+    fn lut16_mft2_byte_identical() {
+        assert_lut_resave_identical("test1", A2B0, A2B0, V2, false, "mft2 test1/A2B0");
+    }
+
+    /// `mft2` again over a different profile, to exercise larger CLUT tables.
+    #[test]
+    fn lut16_mft2_test2_byte_identical() {
+        assert_lut_resave_identical("test2", A2B0, A2B0, V2, false, "mft2 test2/A2B0");
+    }
+
+    /// Slice the body of the single tag from a serialized profile (after its
+    /// 8-byte type base, length = directory `size` - 8). The profile carries
+    /// exactly one tag (the deterministic header + one LUT tag), so the directory
+    /// has one entry at offset 132.
+    fn slice_only_tag_body(profile: &[u8]) -> &[u8] {
+        let count = u32::from_be_bytes(profile[128..132].try_into().unwrap());
+        assert_eq!(count, 1, "expected a single-tag profile");
+        let offset = u32::from_be_bytes(profile[132 + 4..132 + 8].try_into().unwrap()) as usize;
+        let size = u32::from_be_bytes(profile[132 + 8..132 + 12].try_into().unwrap()) as usize;
+        // Body = the tag bytes minus the 8-byte type base.
+        &profile[offset + 8..offset + size]
+    }
+
+    /// `mft1` (LUT8) BODY: the test3 A2B0 LUT8, written by the rcms LUT8 body
+    /// writer, compared to the LUT8 body lcms2 emits when re-serializing the same
+    /// parsed pipeline with `SaveAs8Bits` forced on. rcms's `Tag::Lut` carries no
+    /// `SaveAs8Bits`, so the whole-profile dispatch never selects mft1 (it would
+    /// pick mft2 at v2); we drive the body writer directly and diff the body
+    /// bytes against lcms2's forced-8-bit serialization.
+    fn assert_lut8_body_identical(testbed: &str, src_sig: Signature, label: &str) {
+        let path = format!(
+            "{}/../../vendor/Little-CMS/testbed/{testbed}.icc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{label}: read {path}: {e}"));
+        let prof = Profile::open(&bytes).expect("open testbed");
+        let lut = match prof.read_tag(src_sig).expect("read LUT tag") {
+            Tag::Lut(p) => p,
+            other => panic!("{label}: expected Lut, got {other:?}"),
+        };
+
+        let mut w = MemWriter::new();
+        write_tag_body(&mut w, &Tag::Lut(lut), SIG_LUT8_TYPE, 2.3).expect("rcms LUT8 body");
+        let rust_body = w.as_bytes();
+
+        let c = rcms_oracle::resave_lut_tag(&bytes, src_sig.to_raw(), src_sig.to_raw(), 2.3, true)
+            .expect("lcms2 resave (mft1)");
+        let c_body = slice_only_tag_body(&c);
+
+        assert_eq!(
+            rust_body.len(),
+            c_body.len(),
+            "{label}: LUT8 body length mismatch rcms={} lcms2={}",
+            rust_body.len(),
+            c_body.len()
+        );
+        if rust_body != c_body {
+            let first = rust_body.iter().zip(c_body).position(|(a, b)| a != b);
+            panic!("{label}: LUT8 body byte mismatch at {first:?}");
+        }
+    }
+
+    /// `mft1` body over an A2B LUT8 (test3 A2B0).
+    #[test]
+    fn lut8_mft1_body_byte_identical() {
+        assert_lut8_body_identical("test3", A2B0, "mft1 test3/A2B0");
+    }
+
+    /// `mft1` body over a B2A LUT8 (test1 B2A0).
+    #[test]
+    fn lut8_mft1_b2a_body_byte_identical() {
+        assert_lut8_body_identical("test1", B2A0, "mft1 test1/B2A0");
+    }
+
+    /// `mAB ` (LutAtoB): the test4 A2B0 (curves + matrix + CLUT), re-serialized at
+    /// v4 (so DecideLUTtypeA2B picks mAB). Exercises the offset directory +
+    /// back-patch, WriteSetOfCurves, WriteMatrix, and WriteCLUT.
+    #[test]
+    fn lut_a2b_mab_byte_identical() {
+        assert_lut_resave_identical("test4", A2B0, A2B0, V4, false, "mAB test4/A2B0");
+    }
+
+    /// `mBA ` (LutBtoA): the test4 B2A0, re-serialized at v4 (DecideLUTtypeB2A →
+    /// mBA). The B2A role mapping mirrors mAB with reversed stage order.
+    #[test]
+    fn lut_b2a_mba_byte_identical() {
+        assert_lut_resave_identical("test4", B2A0, B2A0, V4, false, "mBA test4/B2A0");
+    }
+
+    /// `mpet` (multiProcessElements): a synthetic curve-set → matrix → float-CLUT
+    /// pipeline built identically in rcms and lcms2, serialized under DToB0 at v4.
+    /// Exercises the position-table back-patch and the cvst/matf/clut element
+    /// writers.
+    #[test]
+    fn mpe_mpet_byte_identical() {
+        use crate::curve::{build_mpe_segmented, CurveSegment};
+        use crate::interp::InterpParams;
+        use crate::pipeline::clut::{Clut, ClutTable};
+
+        const DTOB0: Signature = Signature::from_bytes(*b"D2B0");
+
+        // Curve-set: three identical single-segment formula curves (stored Type 6
+        // = on-disk formula type 0: Y = (a*X + b)^g + c), matching the oracle.
+        let make_curve = || {
+            let mut params = [0.0f64; 10];
+            params[0] = 1.0; // g
+            params[1] = 1.0; // a
+            params[2] = 0.0; // b
+            params[3] = 0.0; // c
+            build_mpe_segmented(vec![CurveSegment {
+                x0: -1e22,
+                x1: 1e22,
+                seg_type: 6,
+                params,
+                sampled: Vec::new(),
+            }])
+        };
+
+        let mut lut = Pipeline::new(3, 3);
+        lut.insert_stage_at_end(Stage::ToneCurves(vec![
+            make_curve(),
+            make_curve(),
+            make_curve(),
+        ]))
+        .unwrap();
+
+        // Matrix 3x3 with offset (same values as the oracle).
+        lut.insert_stage_at_end(Stage::Matrix {
+            rows: 3,
+            cols: 3,
+            m: vec![1.1, 0.0, 0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 1.05],
+            offset: Some(vec![0.01, -0.02, 0.03]),
+        })
+        .unwrap();
+
+        // Float CLUT, 2 points per dimension, 3->3, zero-initialized (NULL data).
+        let grid = [2u32, 2, 2];
+        let params = InterpParams::new(&grid, 3, 3);
+        let n_entries = 3 * 2 * 2 * 2;
+        lut.insert_stage_at_end(Stage::Clut(Clut {
+            table: ClutTable::F32(vec![0.0f32; n_entries]),
+            params,
+            is_trilinear: false,
+        }))
+        .unwrap();
+
+        let mut p = WritableProfile::new(header_versioned(V4));
+        p.add_tag(DTOB0, Tag::Lut(lut));
+        let rust = save_to_mem(&p).expect("rcms serialize");
+
+        let c = rcms_oracle::save_mpe_tag().expect("lcms2 mpe serialize");
+        assert_eq!(
+            rust.len(),
+            c.len(),
+            "mpet: length mismatch rcms={} lcms2={}",
+            rust.len(),
+            c.len()
+        );
+        if rust != c {
+            let first = rust.iter().zip(&c).position(|(a, b)| a != b);
+            panic!("mpet: byte mismatch at {first:?}");
+        }
     }
 }
