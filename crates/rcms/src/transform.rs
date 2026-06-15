@@ -968,7 +968,10 @@ impl Transform {
         out_fmt: u32,
         strategy: OptimizationStrategy,
     ) -> Result<Transform> {
-        let mut xform = Transform::new(profiles, intents, bpc, adaptation, flags)?;
+        // Route the link through `new_in(ctx, …)` so a registered custom INTENT
+        // composes with the custom OPTIMIZER below (both plugins honored on the
+        // same transform). With an empty `ctx` this is identical to `new`.
+        let mut xform = Transform::new_in(ctx, profiles, intents, bpc, adaptation, flags)?;
         xform.formatters = Some(select_formatters(in_fmt, out_fmt, flags)?);
         xform.strategy = strategy;
         // lcms2 passes the LAST intent to `_cmsOptimizePipeline`
