@@ -421,6 +421,26 @@ unsafe extern "C" {
     fn rcms_oracle_unpack16(fmt: u32, buf: *const u8, out: *mut u16);
     fn rcms_oracle_pack16(fmt: u32, values: *const u16, out: *mut u8, nbytes: *mut u32);
 
+    // Float/double pixel-format formatters (CMS_PACK_FLAGS_FLOAT).
+    fn rcms_oracle_unpack_float(fmt: u32, buf: *const u8, out: *mut f32);
+    fn rcms_oracle_pack_float(fmt: u32, values: *const f32, out: *mut u8, nbytes: *mut u32);
+
+    // Format-aware do_transform (NOOPTIMIZE) over packed byte buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_do_transform_packed(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
     fn rcms_oracle_from_8_to_16(v: u8) -> u16;
     fn rcms_oracle_from_16_to_8(v: u16) -> u8;
 }
@@ -472,6 +492,88 @@ pub fn pack16(fmt: u32, values: &[u16; MAX_CHANNELS], out: &mut [u8]) -> usize {
         rcms_oracle_pack16(fmt, values.as_ptr(), out.as_mut_ptr(), &mut nbytes);
     }
     nbytes as usize
+}
+
+/// Drive lcms2's real stock FLOAT unpack formatter for `fmt` on `buf`
+/// (`_cmsGetFormatter(..., CMS_PACK_FLAGS_FLOAT)`) and return the f32 values it
+/// produces (cmsMAXCHANNELS wide; channels beyond T_CHANNELS left zero).
+///
+/// `buf` must hold at least one packed pixel for `fmt`.
+pub fn unpack_float(fmt: u32, buf: &[u8]) -> [f32; MAX_CHANNELS] {
+    let mut out = [0f32; MAX_CHANNELS];
+    // SAFETY: `buf` is a valid readable slice holding one packed pixel of `fmt`;
+    // lcms2's stock float formatters read only those bytes and write only
+    // T_CHANNELS(fmt) <= MAX_CHANNELS f32 entries into `out`. The shim sets a
+    // zeroed _cmsTRANSFORM with only InputFormat, the sole field they read.
+    unsafe {
+        rcms_oracle_unpack_float(fmt, buf.as_ptr(), out.as_mut_ptr());
+    }
+    out
+}
+
+/// Drive lcms2's real stock FLOAT pack formatter for `fmt` on `values` and return
+/// the packed bytes it writes. `out` must be large enough for one packed pixel of
+/// `fmt`; the return value is the byte count lcms2 advanced.
+pub fn pack_float(fmt: u32, values: &[f32; MAX_CHANNELS], out: &mut [u8]) -> usize {
+    let mut nbytes: u32 = 0;
+    // SAFETY: `values` is MAX_CHANNELS wide (lcms2 reads at most T_CHANNELS +
+    // T_EXTRA entries); `out` is a valid writable slice sized to one packed pixel
+    // for `fmt`. The shim sets a zeroed _cmsTRANSFORM with only OutputFormat and
+    // returns the advanced byte count via `nbytes`.
+    unsafe {
+        rcms_oracle_pack_float(fmt, values.as_ptr(), out.as_mut_ptr(), &mut nbytes);
+    }
+    nbytes as usize
+}
+
+/// lcms2 `cmsCreateExtendedTransform` (NOOPTIMIZE) over `profiles` with the
+/// caller's explicit in/out format words, then `cmsDoTransform` over `n_pixels`
+/// packed pixels. `input` is `n_pixels * <bytes-per-pixel(in_fmt)>` bytes;
+/// `output` is sized for `n_pixels * <bytes-per-pixel(out_fmt)>` and written in
+/// place. Returns `true` on success, `false` if a profile fails to open or the
+/// transform cannot be created. This is the format-aware end-to-end reference.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    let n = profiles.len();
+    assert_eq!(intents.len(), n);
+    assert_eq!(bpc.len(), n);
+    assert_eq!(adaptation.len(), n);
+
+    let bufs: Vec<*const u8> = profiles.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<u32> = profiles.iter().map(|p| p.len() as u32).collect();
+    let bpc_i: Vec<i32> = bpc.iter().map(|&b| b as i32).collect();
+
+    // SAFETY: `bufs`/`lens` describe `n` valid readable profile slices C only
+    // reads; `intents`/`bpc_i`/`adaptation` are `n`-element readable arrays. C
+    // reads `n_pixels` packed pixels of `in_fmt` from `input` and writes
+    // `n_pixels` packed pixels of `out_fmt` into `output`; the caller sizes both.
+    // The transform and all profiles are freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_do_transform_packed(
+            bufs.as_ptr(),
+            lens.as_ptr(),
+            n as u32,
+            intents.as_ptr(),
+            bpc_i.as_ptr(),
+            adaptation.as_ptr(),
+            in_fmt,
+            out_fmt,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            n_pixels as u32,
+        )
+    };
+    ok != 0
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).

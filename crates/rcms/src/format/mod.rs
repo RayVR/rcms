@@ -6,6 +6,7 @@
 //! select a formatter for a format word, mirroring lcms2's stock table match.
 
 pub mod decode;
+pub mod float;
 pub mod formatters;
 
 pub use decode::PixelFormat;
@@ -18,6 +19,21 @@ pub type UnpackFn = Box<dyn Fn(&[u8], &mut [u16; MAX_CHANNELS]) -> usize + Send 
 /// A pack formatter: write one pixel of `values` into `output`, returning the
 /// number of bytes produced.
 pub type PackFn = Box<dyn Fn(&[u16; MAX_CHANNELS], &mut [u8]) -> usize + Send + Sync>;
+
+/// A float unpack formatter: read one packed pixel into an `f32` value array,
+/// returning the number of bytes consumed.
+pub type UnpackFloatFn = Box<dyn Fn(&[u8], &mut [f32; MAX_CHANNELS]) -> usize + Send + Sync>;
+
+/// A float pack formatter: write one pixel of `f32` values into `output`,
+/// returning the number of bytes produced.
+pub type PackFloatFn = Box<dyn Fn(&[f32; MAX_CHANNELS], &mut [u8]) -> usize + Send + Sync>;
+
+/// lcms2 `_cmsFormatterIsFloat` (cmspack.c:4011): a format uses the float
+/// (`FloatXFORM`) path iff its `T_FLOAT` bit is set. Note both `*_FLT` (T_BYTES=4)
+/// and `*_DBL` (T_BYTES=0) formats carry the float bit.
+pub fn formatter_is_float(fmt: u32) -> bool {
+    PixelFormat(fmt).is_float()
+}
 
 /// Select an unpack formatter for `fmt`, or `None` if this task does not handle
 /// it (float/double, planar, premul, named-color, etc. — later tasks).
@@ -155,6 +171,131 @@ pub fn get_output_formatter(fmt: u32) -> Option<PackFn> {
     }
 }
 
+/// Select a float unpack formatter for `fmt`, or `None` if unhandled.
+///
+/// Mirrors lcms2's stock `InputFormattersFloat` table (cmspack.c:3647): the
+/// Lab/XYZ float+double rows scale into 0..1; the generic `FLOAT_SH(1)` rows
+/// dispatch to [`float::unroll_floats_to_float`] (T_BYTES=4) or
+/// [`float::unroll_doubles_to_float`] (T_BYTES=0); 8/16-bit input formats
+/// (non-float words) map to [`float::unroll_8_to_float`] / `unroll_16_to_float`
+/// (lcms2 selects these for `CMS_PACK_FLAGS_FLOAT` over an integer input). Planar
+/// and premultiplied layouts are out of scope here.
+pub fn get_input_formatter_float(fmt: u32) -> Option<UnpackFloatFn> {
+    let f = PixelFormat(fmt);
+    if f.planar() || f.premul() {
+        return None;
+    }
+    let n_chan = f.channels() as usize;
+    let extra = f.extra() as usize;
+    if n_chan == 0 || n_chan + extra > MAX_CHANNELS {
+        return None;
+    }
+
+    // Lab/XYZ float + double specialized rows (3-channel, scaled).
+    if f.colorspace() == decode::PT_LAB && n_chan == 3 {
+        if f.is_float() && f.bytes() == 4 {
+            return Some(Box::new(move |a, v| {
+                float::unroll_lab_float_to_float(f, a, v)
+            }));
+        }
+        if f.is_float() && f.bytes() == 0 {
+            return Some(Box::new(move |a, v| {
+                float::unroll_lab_double_to_float(f, a, v)
+            }));
+        }
+    }
+    if f.colorspace() == decode::PT_XYZ && n_chan == 3 {
+        if f.is_float() && f.bytes() == 4 {
+            return Some(Box::new(move |a, v| {
+                float::unroll_xyz_float_to_float(f, a, v)
+            }));
+        }
+        if f.is_float() && f.bytes() == 0 {
+            return Some(Box::new(move |a, v| {
+                float::unroll_xyz_double_to_float(f, a, v)
+            }));
+        }
+    }
+
+    if f.is_float() {
+        // Generic float (T_BYTES=4) / double (T_BYTES=0).
+        match f.bytes() {
+            4 => Some(Box::new(move |a, v| float::unroll_floats_to_float(f, a, v))),
+            0 => Some(Box::new(move |a, v| {
+                float::unroll_doubles_to_float(f, a, v)
+            })),
+            _ => None,
+        }
+    } else {
+        // Integer input under the float path (8/16-bit → float).
+        match f.bytes() {
+            1 => Some(Box::new(move |a, v| float::unroll_8_to_float(f, a, v))),
+            2 => Some(Box::new(move |a, v| float::unroll_16_to_float(f, a, v))),
+            _ => None,
+        }
+    }
+}
+
+/// Select a float pack formatter for `fmt`, or `None` if unhandled.
+///
+/// Mirrors lcms2's stock `OutputFormattersFloat` table (cmspack.c:3815): the
+/// Lab/XYZ rows; the generic `FLOAT_SH(1)` rows ([`float::pack_floats_from_float`]
+/// / `pack_doubles_from_float`); and the 8/16-bit output rows, which in lcms2's
+/// float table are [`float::pack_bytes_from_float`] / `pack_words_from_float`
+/// (consuming the float-evaluated `fOut[]`). Planar/premul out of scope.
+pub fn get_output_formatter_float(fmt: u32) -> Option<PackFloatFn> {
+    let f = PixelFormat(fmt);
+    if f.planar() || f.premul() {
+        return None;
+    }
+    let n_chan = f.channels() as usize;
+    let extra = f.extra() as usize;
+    if n_chan == 0 || n_chan + extra > MAX_CHANNELS {
+        return None;
+    }
+
+    if f.colorspace() == decode::PT_LAB && n_chan == 3 {
+        if f.is_float() && f.bytes() == 4 {
+            return Some(Box::new(move |v, o| {
+                float::pack_lab_float_from_float(f, v, o)
+            }));
+        }
+        if f.is_float() && f.bytes() == 0 {
+            return Some(Box::new(move |v, o| {
+                float::pack_lab_double_from_float(f, v, o)
+            }));
+        }
+    }
+    if f.colorspace() == decode::PT_XYZ && n_chan == 3 {
+        if f.is_float() && f.bytes() == 4 {
+            return Some(Box::new(move |v, o| {
+                float::pack_xyz_float_from_float(f, v, o)
+            }));
+        }
+        if f.is_float() && f.bytes() == 0 {
+            return Some(Box::new(move |v, o| {
+                float::pack_xyz_double_from_float(f, v, o)
+            }));
+        }
+    }
+
+    if f.is_float() {
+        match f.bytes() {
+            4 => Some(Box::new(move |v, o| float::pack_floats_from_float(f, v, o))),
+            0 => Some(Box::new(move |v, o| {
+                float::pack_doubles_from_float(f, v, o)
+            })),
+            _ => None,
+        }
+    } else {
+        match f.bytes() {
+            1 => Some(Box::new(move |v, o| float::pack_bytes_from_float(f, v, o))),
+            2 => Some(Box::new(move |v, o| float::pack_words_from_float(f, v, o))),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::decode::*;
@@ -256,6 +397,131 @@ mod tests {
 
                 assert_eq!(got, want, "{name} ({fmt:#x}) pack of {values:04x?}");
             }
+        }
+    }
+
+    /// All (covered) float/double formats this task implements.
+    fn covered_float_formats() -> Vec<(&'static str, u32)> {
+        vec![
+            ("GRAY_FLT", TYPE_GRAY_FLT),
+            ("RGB_FLT", TYPE_RGB_FLT),
+            ("RGBA_FLT", TYPE_RGBA_FLT),
+            ("BGR_FLT", TYPE_BGR_FLT),
+            ("CMYK_FLT", TYPE_CMYK_FLT),
+            ("LAB_FLT", TYPE_LAB_FLT),
+            ("XYZ_FLT", TYPE_XYZ_FLT),
+            ("GRAY_DBL", TYPE_GRAY_DBL),
+            ("RGB_DBL", TYPE_RGB_DBL),
+            ("BGR_DBL", TYPE_BGR_DBL),
+            ("CMYK_DBL", TYPE_CMYK_DBL),
+            ("LAB_DBL", TYPE_LAB_DBL),
+            ("XYZ_DBL", TYPE_XYZ_DBL),
+        ]
+    }
+
+    /// Sample byte count of one packed pixel for `fmt` (handles double=8).
+    fn pixel_bytes_any(fmt: u32) -> usize {
+        let f = PixelFormat(fmt);
+        let sample = match f.bytes() {
+            0 => 8,
+            b => b as usize,
+        };
+        (f.channels() + f.extra()) as usize * sample
+    }
+
+    /// A random float in a representative range for unpacking. Lab/XYZ floats
+    /// live in Lab/XYZ units, generic float in 0..1ish; we span a broad range to
+    /// exercise the scaling and the f64→f32 truncation exactly.
+    fn rand_f32(rng: &mut Rng) -> f32 {
+        // Uniform-ish in [-200, 200] from 32 random bits.
+        let u = (rng.next_u64() & 0xffff_ffff) as u32;
+        let unit = (u as f64) / (u32::MAX as f64); // 0..1
+        ((unit * 400.0) - 200.0) as f32
+    }
+
+    #[test]
+    fn unpack_float_matches_oracle_all_formats() {
+        let mut rng = Rng::new(0x00F1_0A77);
+        for (name, fmt) in covered_float_formats() {
+            let unpack = get_input_formatter_float(fmt)
+                .unwrap_or_else(|| panic!("no float input formatter for {name} ({fmt:#x})"));
+            let nbytes = pixel_bytes_any(fmt);
+            let f = PixelFormat(fmt);
+            let is_dbl = f.bytes() == 0;
+            for _ in 0..50_000 {
+                // Build a packed pixel as random f32/f64 samples.
+                let mut buf = vec![0u8; nbytes];
+                let n_samples = (f.channels() + f.extra()) as usize;
+                for s in 0..n_samples {
+                    let val = rand_f32(&mut rng);
+                    if is_dbl {
+                        buf[s * 8..s * 8 + 8].copy_from_slice(&(val as f64).to_le_bytes());
+                    } else {
+                        buf[s * 4..s * 4 + 4].copy_from_slice(&val.to_le_bytes());
+                    }
+                }
+
+                let mut got = [0f32; MAX_CHANNELS];
+                let consumed = unpack(&buf, &mut got);
+                assert_eq!(consumed, nbytes, "{name}: bytes consumed");
+
+                let want = rcms_oracle::unpack_float(fmt, &buf);
+                for ch in 0..MAX_CHANNELS {
+                    assert_eq!(
+                        got[ch].to_bits(),
+                        want[ch].to_bits(),
+                        "{name} ({fmt:#x}) unpack ch{ch}: rust={} lcms2={}",
+                        got[ch],
+                        want[ch]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pack_float_matches_oracle_all_formats() {
+        let mut rng = Rng::new(0x00F1_AC44);
+        for (name, fmt) in covered_float_formats() {
+            let pack = get_output_formatter_float(fmt)
+                .unwrap_or_else(|| panic!("no float output formatter for {name} ({fmt:#x})"));
+            let nbytes = pixel_bytes_any(fmt);
+            let f = PixelFormat(fmt);
+            for _ in 0..50_000 {
+                // Pipeline output values are 0..1 (post-eval); span a bit beyond
+                // to exercise FLAVOR/scale edges.
+                let mut values = [0f32; MAX_CHANNELS];
+                for v in values.iter_mut().take(f.channels() as usize) {
+                    let u = (rng.next_u64() & 0xffff_ffff) as u32;
+                    *v = ((u as f64) / (u32::MAX as f64)) as f32 * 1.2 - 0.1;
+                }
+
+                // Pre-fill output identically on both sides (extra bytes untouched).
+                let init: Vec<u8> = (0..nbytes).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+
+                let mut got = init.clone();
+                let produced = pack(&values, &mut got);
+                assert_eq!(produced, nbytes, "{name}: bytes produced");
+
+                let mut want = init.clone();
+                let mut wide = [0f32; rcms_oracle::MAX_CHANNELS];
+                wide[..MAX_CHANNELS].copy_from_slice(&values);
+                let wn = rcms_oracle::pack_float(fmt, &wide, &mut want);
+                assert_eq!(wn, nbytes, "{name}: oracle bytes produced");
+
+                assert_eq!(got, want, "{name} ({fmt:#x}) pack of {values:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn float_path_selection_matches_lcms2() {
+        // _cmsFormatterIsFloat: true iff T_FLOAT bit set (FLT and DBL both set it).
+        for (_n, fmt) in covered_float_formats() {
+            assert!(formatter_is_float(fmt), "{fmt:#x} should be float");
+        }
+        for (_n, fmt) in covered_formats() {
+            assert!(!formatter_is_float(fmt), "{fmt:#x} should NOT be float");
         }
     }
 

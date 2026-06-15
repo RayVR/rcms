@@ -16,6 +16,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rcms::format::decode;
+use rcms::format::PixelFormat;
 use rcms::profile::{ColorSpace, Profile, RenderingIntent};
 use rcms::transform::Transform;
 
@@ -386,4 +388,241 @@ fn do_transform_iterates_multiple_pixels() {
             );
         }
     }
+}
+
+// --- End-to-end format-aware do_transform (packed buffers) ------------------
+
+/// Pixel-format kinds we drive end-to-end. `Flt`/`Dbl` use the float path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    U8,
+    U16,
+    Flt,
+    Dbl,
+}
+
+/// Bytes per sample for a kind.
+fn kind_sample_bytes(k: Kind) -> usize {
+    match k {
+        Kind::U8 => 1,
+        Kind::U16 => 2,
+        Kind::Flt => 4,
+        Kind::Dbl => 8,
+    }
+}
+
+/// Build the `TYPE_*` format word for a device color space with `n_chan`
+/// channels and the given sample kind (no extra/swap/flavor — plain chunky).
+fn make_format(cs: ColorSpace, n_chan: usize, k: Kind) -> Option<u32> {
+    // Match the PT_* the profile's device space uses.
+    let (pt, chans) = match cs {
+        ColorSpace::Gray => (decode::PT_GRAY, 1),
+        ColorSpace::Rgb => (decode::PT_RGB, 3),
+        ColorSpace::Cmyk => (decode::PT_CMYK, 4),
+        _ => return None,
+    };
+    if chans != n_chan {
+        return None;
+    }
+    let bytes = match k {
+        Kind::U8 => 1u32,
+        Kind::U16 => 2,
+        Kind::Flt => 4,
+        Kind::Dbl => 0,
+    };
+    let float_bit = if matches!(k, Kind::Flt | Kind::Dbl) {
+        decode::float_marker(1)
+    } else {
+        0
+    };
+    Some(float_bit | (pt << 16) | ((chans as u32) << 3) | bytes)
+}
+
+/// Encode one 0..1 float channel value into `dst` at the right kind. For device
+/// (RGB/CMYK/Gray) formats lcms2's unpack scales 8/16-bit by /255 or /65535 and
+/// float by identity (or /100 for ink). To feed the *same* numbers to both rcms
+/// and lcms2 we just write the packed representation of the chosen 0..1 grid:
+/// for 8/16-bit we quantize, for float we write the value directly (device float
+/// is 0..1 identity for RGB/Gray; CMYK float would be /100, but we feed 0..1 so
+/// both sides see the identical bytes and therefore the identical unpacked value).
+fn encode_sample(dst: &mut [u8], v: f32, k: Kind) {
+    match k {
+        Kind::U8 => {
+            let q = (v as f64 * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
+            dst[0] = q;
+        }
+        Kind::U16 => {
+            let q = (v as f64 * 65535.0 + 0.5).floor().clamp(0.0, 65535.0) as u16;
+            dst[..2].copy_from_slice(&q.to_le_bytes());
+        }
+        Kind::Flt => dst[..4].copy_from_slice(&v.to_le_bytes()),
+        Kind::Dbl => dst[..8].copy_from_slice(&(v as f64).to_le_bytes()),
+    }
+}
+
+fn pixel_bytes_fmt(fmt: u32) -> usize {
+    let f = PixelFormat(fmt);
+    let sample = match f.bytes() {
+        0 => 8,
+        b => b as usize,
+    };
+    (f.channels() + f.extra()) as usize * sample
+}
+
+#[test]
+fn do_transform_packed_matches_oracle_over_testbed_pairs() {
+    let files = testbed_icc();
+    assert!(!files.is_empty(), "no .icc in testbed");
+
+    let mut loaded: Vec<Loaded> = Vec::new();
+    for path in &files {
+        let bytes = fs::read(path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if !rcms_oracle::open_succeeds(&bytes) {
+            continue;
+        }
+        if Profile::open(&bytes).is_err() {
+            continue;
+        }
+        loaded.push(Loaded { name, bytes });
+    }
+    assert!(loaded.len() >= 2, "need at least two loadable profiles");
+
+    // Relative + absolute, BPC off (avoid the forced-BPC V4 perc/sat cells that
+    // the slice-5 sweep already documents as deferred for some profiles).
+    let intents = [
+        RenderingIntent::RelativeColorimetric,
+        RenderingIntent::AbsoluteColorimetric,
+    ];
+    let adaptation = [1.0f64, 1.0f64];
+    let bpc = [false, false];
+
+    // Sample-kind pairs to exercise (in_kind, out_kind): a 16-bit pair, an 8→16
+    // pair, a float pair (FloatXFORM path), and a double pair.
+    let kind_pairs = [
+        (Kind::U8, Kind::U16),
+        (Kind::U16, Kind::U16),
+        (Kind::U8, Kind::U8),
+        (Kind::Flt, Kind::Flt),
+        (Kind::U16, Kind::Flt), // mixed: float path (output float)
+        (Kind::Dbl, Kind::Dbl),
+    ];
+
+    let mut cells = 0usize;
+    let mut byte_samples = 0usize;
+    let mut float_cells = 0usize;
+    let mut u16_cells = 0usize;
+
+    for a in &loaded {
+        for b in &loaded {
+            if a.name == b.name {
+                continue;
+            }
+            let pa = Profile::open(&a.bytes).unwrap();
+            let pb = Profile::open(&b.bytes).unwrap();
+
+            let in_cs = pa.header().color_space;
+            let out_cs = pb.header().color_space;
+            let in_chans = match channels(in_cs) {
+                Some(c) => c,
+                None => continue,
+            };
+            let out_chans = match channels(out_cs) {
+                Some(c) => c,
+                None => continue,
+            };
+            // Only device spaces we can build a TYPE_* word for.
+            if !matches!(in_cs, ColorSpace::Gray | ColorSpace::Rgb | ColorSpace::Cmyk)
+                || !matches!(
+                    out_cs,
+                    ColorSpace::Gray | ColorSpace::Rgb | ColorSpace::Cmyk
+                )
+            {
+                continue;
+            }
+
+            let levels = if in_chans >= 4 { 4 } else { 6 };
+            let grid = input_grid(in_chans, levels);
+
+            for &intent in &intents {
+                let intents_raw = [intent.to_raw(), intent.to_raw()];
+
+                for &(ik, ok) in &kind_pairs {
+                    let in_fmt = match make_format(in_cs, in_chans, ik) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    let out_fmt = match make_format(out_cs, out_chans, ok) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+
+                    // Pack the grid into input bytes.
+                    let in_stride = pixel_bytes_fmt(in_fmt);
+                    let out_stride = pixel_bytes_fmt(out_fmt);
+                    let mut packed_in = vec![0u8; grid.len() * in_stride];
+                    let isb = kind_sample_bytes(ik);
+                    for (p, row) in grid.iter().enumerate() {
+                        for (c, &v) in row.iter().enumerate() {
+                            let off = p * in_stride + c * isb;
+                            encode_sample(&mut packed_in[off..], v, ik);
+                        }
+                    }
+
+                    // Oracle reference (NOOPTIMIZE).
+                    let mut oracle_out = vec![0u8; grid.len() * out_stride];
+                    let ok_built = rcms_oracle::do_transform_packed(
+                        &[&a.bytes, &b.bytes],
+                        &intents_raw,
+                        &bpc,
+                        &adaptation,
+                        in_fmt,
+                        out_fmt,
+                        &packed_in,
+                        &mut oracle_out,
+                        grid.len(),
+                    );
+                    if !ok_built {
+                        continue; // lcms2 rejected this chain; rcms not required.
+                    }
+
+                    // rcms transform.
+                    let xform = match Transform::new_simple_with_formats(
+                        &pa, &pb, intent, false, in_fmt, out_fmt,
+                    ) {
+                        Ok(x) => x,
+                        Err(_) => continue, // deferred (e.g. forced-BPC detection cell)
+                    };
+                    let mut rcms_out = vec![0u8; grid.len() * out_stride];
+                    xform.do_transform(&packed_in, &mut rcms_out, grid.len());
+
+                    assert_eq!(
+                        rcms_out, oracle_out,
+                        "PACKED {} -> {} ({intent:?}) in={in_fmt:#x} out={out_fmt:#x}: \
+                         byte mismatch",
+                        a.name, b.name
+                    );
+
+                    cells += 1;
+                    byte_samples += grid.len();
+                    if PixelFormat(in_fmt).is_float() || PixelFormat(out_fmt).is_float() {
+                        float_cells += 1;
+                    } else {
+                        u16_cells += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "Packed do_transform sweep: {cells} (pair×intent×format) cells bit-exact \
+         vs lcms2 NOOPTIMIZE ({byte_samples} pixels). float-path cells: {float_cells}, \
+         16-bit-path cells: {u16_cells}."
+    );
+    assert!(cells > 0, "expected at least one packed format cell");
+    assert!(
+        float_cells > 0 && u16_cells > 0,
+        "both paths must be exercised"
+    );
 }

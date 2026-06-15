@@ -188,6 +188,25 @@ pub const TYPE_KCMY_8: u32 =
 pub const TYPE_KCMY_16: u32 =
     colorspace_sh(PT_CMYK) | channels_sh(4) | bytes_sh(2) | swapfirst_sh(1);
 
+// --- Float / double TYPE_* constants (lcms2.h:945-975) ---
+pub const TYPE_GRAY_FLT: u32 = float_sh(1) | colorspace_sh(PT_GRAY) | channels_sh(1) | bytes_sh(4);
+pub const TYPE_RGB_FLT: u32 = float_sh(1) | colorspace_sh(PT_RGB) | channels_sh(3) | bytes_sh(4);
+pub const TYPE_RGBA_FLT: u32 =
+    float_sh(1) | colorspace_sh(PT_RGB) | extra_sh(1) | channels_sh(3) | bytes_sh(4);
+pub const TYPE_BGR_FLT: u32 =
+    float_sh(1) | colorspace_sh(PT_RGB) | channels_sh(3) | bytes_sh(4) | doswap_sh(1);
+pub const TYPE_CMYK_FLT: u32 = float_sh(1) | colorspace_sh(PT_CMYK) | channels_sh(4) | bytes_sh(4);
+pub const TYPE_LAB_FLT: u32 = float_sh(1) | colorspace_sh(PT_LAB) | channels_sh(3) | bytes_sh(4);
+pub const TYPE_XYZ_FLT: u32 = float_sh(1) | colorspace_sh(PT_XYZ) | channels_sh(3) | bytes_sh(4);
+
+pub const TYPE_GRAY_DBL: u32 = float_sh(1) | colorspace_sh(PT_GRAY) | channels_sh(1) | bytes_sh(0);
+pub const TYPE_RGB_DBL: u32 = float_sh(1) | colorspace_sh(PT_RGB) | channels_sh(3) | bytes_sh(0);
+pub const TYPE_BGR_DBL: u32 =
+    float_sh(1) | colorspace_sh(PT_RGB) | channels_sh(3) | bytes_sh(0) | doswap_sh(1);
+pub const TYPE_CMYK_DBL: u32 = float_sh(1) | colorspace_sh(PT_CMYK) | channels_sh(4) | bytes_sh(0);
+pub const TYPE_LAB_DBL: u32 = float_sh(1) | colorspace_sh(PT_LAB) | channels_sh(3) | bytes_sh(0);
+pub const TYPE_XYZ_DBL: u32 = float_sh(1) | colorspace_sh(PT_XYZ) | channels_sh(3) | bytes_sh(0);
+
 // Float marker (used by decoder tests).
 pub const fn float_marker(a: u32) -> u32 {
     float_sh(a)

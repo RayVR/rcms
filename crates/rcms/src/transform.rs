@@ -33,6 +33,10 @@
 //!    optimizer (`cmsFLAGS_NOOPTIMIZE` is forced on) are slice 6.
 
 use crate::color::CIEXYZ;
+use crate::format::{
+    self, formatter_is_float, get_input_formatter, get_input_formatter_float, get_output_formatter,
+    get_output_formatter_float, PackFloatFn, PackFn, UnpackFloatFn, UnpackFn, MAX_CHANNELS,
+};
 use crate::link::{default_icc_intents, link_bpc_mutation};
 use crate::math::whitepoint::D50;
 use crate::pipeline::Pipeline;
@@ -80,6 +84,26 @@ impl Flags {
     }
 }
 
+/// The packing/unpacking layer (lcms2 `FromInput*`/`ToOutput*` + the format
+/// words). Selected once at construction from the input/output `PixelFormat`s,
+/// then used by [`Transform::do_transform`] for the format-aware pixel loop.
+///
+/// lcms2 keeps separate 16-bit and float formatter tables and picks the path via
+/// `_cmsFormatterIsFloat`: if *either* the input or output format carries the
+/// `T_FLOAT` bit, the whole transform uses `FloatXFORM` (both ends are pulled
+/// from the float tables); otherwise the 16-bit `PrecalculatedXFORM` path runs.
+struct Formatters {
+    in_fmt: u32,
+    out_fmt: u32,
+    is_float: bool,
+    // 16-bit path (is_float == false).
+    from_input16: Option<UnpackFn>,
+    to_output16: Option<PackFn>,
+    // Float path (is_float == true).
+    from_input_float: Option<UnpackFloatFn>,
+    to_output_float: Option<PackFloatFn>,
+}
+
 /// A color transform: a device-link pipeline plus the recorded entry/exit color
 /// spaces, media white points, and rendering intent (lcms2 `_cmsTRANSFORM`).
 pub struct Transform {
@@ -92,6 +116,8 @@ pub struct Transform {
     // Gamut-check pipeline (lcms2 `GamutCheck`). Hook only for now — slice 5 does
     // not build it, so it stays `None`.
     gamut_check: Option<Pipeline>,
+    // Packing layer (None for the flat-buffer constructors that bypass formatters).
+    formatters: Option<Formatters>,
 }
 
 /// lcms2 `NormalizeXYZ` (`cmsxform.c:1090-1101`): some profiles store the media
@@ -158,6 +184,54 @@ fn xform_color_spaces(profiles: &[&Profile]) -> Result<(ColorSpace, ColorSpace)>
     Ok((input, post_color_space))
 }
 
+/// Select the input/output formatters for `in_fmt`/`out_fmt`, choosing the float
+/// vs 16-bit path per lcms2 `_cmsFormatterIsFloat` (float if either end is float).
+fn select_formatters(in_fmt: u32, out_fmt: u32) -> Result<Formatters> {
+    let is_float = formatter_is_float(in_fmt) || formatter_is_float(out_fmt);
+
+    if is_float {
+        let from_input_float = get_input_formatter_float(in_fmt)
+            .ok_or(Error::Unsupported("input pixel format not supported"))?;
+        let to_output_float = get_output_formatter_float(out_fmt)
+            .ok_or(Error::Unsupported("output pixel format not supported"))?;
+        Ok(Formatters {
+            in_fmt,
+            out_fmt,
+            is_float,
+            from_input16: None,
+            to_output16: None,
+            from_input_float: Some(from_input_float),
+            to_output_float: Some(to_output_float),
+        })
+    } else {
+        let from_input16 = get_input_formatter(in_fmt)
+            .ok_or(Error::Unsupported("input pixel format not supported"))?;
+        let to_output16 = get_output_formatter(out_fmt)
+            .ok_or(Error::Unsupported("output pixel format not supported"))?;
+        Ok(Formatters {
+            in_fmt,
+            out_fmt,
+            is_float,
+            from_input16: Some(from_input16),
+            to_output16: Some(to_output16),
+            from_input_float: None,
+            to_output_float: None,
+        })
+    }
+}
+
+/// Bytes one packed pixel of `fmt` occupies: `(channels + extra) * bytes`, where
+/// `bytes` is `T_BYTES` (1/2/4) or 8 for double (`T_BYTES == 0`), matching lcms2
+/// `PixelSize` × the per-pixel sample count.
+fn pixel_bytes(fmt: u32) -> usize {
+    let f = format::PixelFormat(fmt);
+    let sample = match f.bytes() {
+        0 => 8, // double
+        b => b as usize,
+    };
+    (f.channels() + f.extra()) as usize * sample
+}
+
 impl Transform {
     /// lcms2 `cmsCreateExtendedTransform` (the device-link build). Applies the
     /// `_cmsLinkProfiles` BPC-array mutation (a copy — the caller's `bpc` is not
@@ -205,7 +279,53 @@ impl Transform {
             // cmsxform.c:1218: RenderingIntent = Intents[nProfiles-1].
             rendering_intent: last_intent,
             gamut_check: None,
+            formatters: None,
         })
+    }
+
+    /// Like [`Transform::new`], but also selects and stores the input/output
+    /// pixel formatters from the in/out `PixelFormat` words so the resulting
+    /// transform can run [`Transform::do_transform`] over packed byte buffers.
+    ///
+    /// The path is chosen exactly as lcms2 (`_cmsFormatterIsFloat`): if either
+    /// `in_fmt` or `out_fmt` is a float format, the float (`FloatXFORM`) path is
+    /// selected and both formatters are pulled from the float tables; otherwise
+    /// the 16-bit path is used. Returns [`Error::Unsupported`] if a formatter for
+    /// either format is not available (e.g. planar/premul/half — later tasks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_formats(
+        profiles: &[&Profile],
+        intents: &[RenderingIntent],
+        bpc: &[bool],
+        adaptation: &[f64],
+        flags: Flags,
+        in_fmt: u32,
+        out_fmt: u32,
+    ) -> Result<Transform> {
+        let mut xform = Transform::new(profiles, intents, bpc, adaptation, flags)?;
+        xform.formatters = Some(select_formatters(in_fmt, out_fmt)?);
+        Ok(xform)
+    }
+
+    /// Convenience 2-profile format-aware constructor (lcms2 `cmsCreateTransform`
+    /// with explicit format words). Forces `NOOPTIMIZE`, default adaptation 1.0.
+    pub fn new_simple_with_formats(
+        input: &Profile,
+        output: &Profile,
+        intent: RenderingIntent,
+        bpc: bool,
+        in_fmt: u32,
+        out_fmt: u32,
+    ) -> Result<Transform> {
+        Transform::new_with_formats(
+            &[input, output],
+            &[intent, intent],
+            &[bpc, bpc],
+            &[1.0, 1.0],
+            Flags::NOOPTIMIZE,
+            in_fmt,
+            out_fmt,
+        )
     }
 
     /// Convenience 2-profile constructor (lcms2 `cmsCreateTransform`, which routes
@@ -300,6 +420,71 @@ impl Transform {
             let pix = &input[i * in_ch..i * in_ch + in_ch];
             let res = self.lut.eval_16(pix);
             output[i * out_ch..i * out_ch + out_ch].copy_from_slice(&res);
+        }
+    }
+
+    /// Format-aware transform over packed byte buffers (lcms2 `cmsDoTransform`):
+    /// for each of `n_pixels`, unpack one packed pixel via the stored input
+    /// formatter → evaluate the pipeline → pack one packed pixel via the output
+    /// formatter. Requires the transform to have been built with
+    /// [`Transform::new_with_formats`] / [`Transform::new_simple_with_formats`].
+    ///
+    /// The float-vs-16-bit path is the one selected at construction
+    /// (`_cmsFormatterIsFloat`): the float path mirrors `FloatXFORM`
+    /// (unpack→`eval_float`→pack), the 16-bit path mirrors `PrecalculatedXFORM`
+    /// (unpack→`eval_16`→pack). Contiguous (chunky) buffers only; stride/planar
+    /// is deferred. The eval call stays abstract (the existing pipeline eval) — no
+    /// optimization is inlined here (that is a later swappable strategy).
+    ///
+    /// # Panics
+    /// Panics if the transform was not built with formatters, or if `input` /
+    /// `output` are too small for `n_pixels` packed pixels of the in/out formats.
+    pub fn do_transform(&self, input: &[u8], output: &mut [u8], n_pixels: usize) {
+        let fmts = self
+            .formatters
+            .as_ref()
+            .expect("do_transform requires a transform built with formats (new_with_formats)");
+
+        let in_ch = self.lut.input_channels;
+        let out_ch = self.lut.output_channels;
+        let in_stride = pixel_bytes(fmts.in_fmt);
+        let out_stride = pixel_bytes(fmts.out_fmt);
+        assert!(
+            input.len() >= n_pixels * in_stride,
+            "input buffer too small"
+        );
+        assert!(
+            output.len() >= n_pixels * out_stride,
+            "output buffer too small"
+        );
+
+        if fmts.is_float {
+            let from_input = fmts.from_input_float.as_ref().unwrap();
+            let to_output = fmts.to_output_float.as_ref().unwrap();
+            let mut fin = [0f32; MAX_CHANNELS];
+            for i in 0..n_pixels {
+                let acc = &input[i * in_stride..];
+                let out = &mut output[i * out_stride..];
+                from_input(acc, &mut fin);
+                // Abstract eval (no inlined optimization — see module docs).
+                let res = self.lut.eval_float(&fin[..in_ch]);
+                let mut fout = [0f32; MAX_CHANNELS];
+                fout[..out_ch].copy_from_slice(&res);
+                to_output(&fout, out);
+            }
+        } else {
+            let from_input = fmts.from_input16.as_ref().unwrap();
+            let to_output = fmts.to_output16.as_ref().unwrap();
+            let mut win = [0u16; MAX_CHANNELS];
+            for i in 0..n_pixels {
+                let acc = &input[i * in_stride..];
+                let out = &mut output[i * out_stride..];
+                from_input(acc, &mut win);
+                let res = self.lut.eval_16(&win[..in_ch]);
+                let mut wout = [0u16; MAX_CHANNELS];
+                wout[..out_ch].copy_from_slice(&res);
+                to_output(&wout, out);
+            }
         }
     }
 }
