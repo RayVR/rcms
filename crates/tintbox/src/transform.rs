@@ -743,6 +743,9 @@ impl Transform {
         // `vec![0; CHUNK*MAX_STAGE_CHANNELS]` zeroing that otherwise dominates the
         // profile as `__bzero`.
         let mut eval_scratch = crate::opt::batched::BatchedScratch::with_capacity(tile);
+        // ONE empty context for the whole call — threaded into the per-tile batched
+        // eval so it never constructs/drops a `Context`'s plugin registries per tile.
+        let eval_ctx = Context::new();
 
         if fmts.is_float {
             let from_input = fmts.from_input_float.as_ref().unwrap();
@@ -769,6 +772,7 @@ impl Transform {
                     &mut chan_out[..m * out_ch],
                     m,
                     &mut eval_scratch,
+                    &eval_ctx,
                 );
                 // Pack the tile back out (padding the packer's MAX_CHANNELS input).
                 let mut fout = [0f32; MAX_CHANNELS];
@@ -808,6 +812,7 @@ impl Transform {
                     &mut chan_out[..m * out_ch],
                     m,
                     &mut eval_scratch,
+                    &eval_ctx,
                 );
                 let mut wout = [0u16; MAX_CHANNELS];
                 for p in 0..m {

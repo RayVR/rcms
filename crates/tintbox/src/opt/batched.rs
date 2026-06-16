@@ -448,7 +448,7 @@ impl BatchedPipeline {
     /// indexes an `InputCurves8` LUT). `output` is `n * out_ch` u16.
     pub fn eval_16_buffer(&self, input: &[u16], output: &mut [u16], n: usize) {
         let mut scratch = BatchedScratch::new();
-        self.eval_16_buffer_with(input, output, n, &mut scratch);
+        self.eval_16_buffer_with(input, output, n, &mut scratch, &Context::new());
     }
 
     /// [`Self::eval_16_buffer`] reusing caller-owned [`BatchedScratch`] (allocated
@@ -460,6 +460,7 @@ impl BatchedPipeline {
         output: &mut [u16],
         n: usize,
         scratch: &mut BatchedScratch,
+        ctx: &Context,
     ) {
         let in_ch = self.in_ch;
         let out_ch = self.out_ch;
@@ -473,9 +474,9 @@ impl BatchedPipeline {
         // Inner tile width: never exceed the scratch capacity (which may be < CHUNK
         // for a small `do_transform` call).
         let tile = (*cap_pixels).min(CHUNK);
-        // ONE empty context for the whole eval — hoisted so a `Generic` tone-curve
-        // stage's `eval_float_in` never allocs/drops a `Context` per pixel.
-        let ctx = Context::new();
+        // `ctx` is created ONCE per `do_transform` (threaded in) — NOT per tile, so
+        // a `Generic` tone-curve stage's `eval_float_in` never allocs/drops a
+        // `Context`'s plugin registries in the hot loop.
 
         let mut base = 0usize;
         while base < n {
@@ -520,7 +521,7 @@ impl BatchedPipeline {
                 let stage_out = stage.output_width(width);
                 match stage {
                     BatchedStage::U16Run(run) => run.eval(cur, nxt, m, u16_scratch),
-                    _ => run_stage(stage, cur, nxt, m, width, stage_out, &ctx),
+                    _ => run_stage(stage, cur, nxt, m, width, stage_out, ctx),
                 }
                 core::mem::swap(&mut cur, &mut nxt);
                 width = stage_out;
@@ -546,7 +547,7 @@ impl BatchedPipeline {
     /// `input` is `n * in_ch` f32; `output` is `n * out_ch` f32.
     pub fn eval_float_buffer(&self, input: &[f32], output: &mut [f32], n: usize) {
         let mut scratch = BatchedScratch::new();
-        self.eval_float_buffer_with(input, output, n, &mut scratch);
+        self.eval_float_buffer_with(input, output, n, &mut scratch, &Context::new());
     }
 
     /// [`Self::eval_float_buffer`] reusing caller-owned [`BatchedScratch`] across
@@ -558,6 +559,7 @@ impl BatchedPipeline {
         output: &mut [f32],
         n: usize,
         scratch: &mut BatchedScratch,
+        ctx: &Context,
     ) {
         let in_ch = self.in_ch;
         let out_ch = self.out_ch;
@@ -570,8 +572,7 @@ impl BatchedPipeline {
         } = scratch;
         // Inner tile width: never exceed the scratch capacity (see `eval_16_buffer`).
         let tile = (*cap_pixels).min(CHUNK);
-        // ONE empty context for the whole eval (see `eval_16_buffer`).
-        let ctx = Context::new();
+        // `ctx` threaded in (created once per `do_transform`, not per tile).
 
         let mut base = 0usize;
         while base < n {
@@ -589,7 +590,7 @@ impl BatchedPipeline {
 
             for stage in &self.stages_float {
                 let stage_out = stage.output_width(width);
-                run_stage(stage, cur, nxt, m, width, stage_out, &ctx);
+                run_stage(stage, cur, nxt, m, width, stage_out, ctx);
                 core::mem::swap(&mut cur, &mut nxt);
                 width = stage_out;
             }
