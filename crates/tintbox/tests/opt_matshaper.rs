@@ -216,9 +216,18 @@ fn accurate_matches_lcms2_nooptimize_8bit() {
         );
         assert!(ok, "lcms2-NOOPTIMIZE transform failed for {an} -> {bn}");
 
-        // tintbox Accurate (default): the optimizer never fires.
-        let xform =
-            Transform::new_simple_with_formats(&pa, &pb, INTENT, false, in_fmt, out_fmt).unwrap();
+        // tintbox Accurate (explicit; AccurateFast is the default since 0.2.0):
+        // the lossy optimizer never fires.
+        let xform = Transform::new_simple_with_formats_strategy(
+            &pa,
+            &pb,
+            INTENT,
+            false,
+            in_fmt,
+            out_fmt,
+            OptimizationStrategy::Accurate,
+        )
+        .unwrap();
         assert_eq!(xform.strategy(), OptimizationStrategy::Accurate);
         assert!(
             !xform.matshaper_fired(),

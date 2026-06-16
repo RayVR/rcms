@@ -397,7 +397,9 @@ impl Transform {
             flags,
             in_fmt,
             out_fmt,
-            OptimizationStrategy::Accurate,
+            // Default since 0.2.0: AccurateFast — lossless, byte-identical to
+            // Accurate, faster for bulk buffers, never slower at any chunk size.
+            OptimizationStrategy::AccurateFast,
         )
     }
 

@@ -99,7 +99,16 @@ fn custom_optimizer_eval_is_used_under_accurate_default() {
     let fmt = type_rgb_8();
 
     // Baseline: no optimizer, Accurate -> in-place pipeline eval.
-    let baseline = Transform::new_simple_with_formats(&pa, &pb, INTENT, false, fmt, fmt).unwrap();
+    let baseline = Transform::new_simple_with_formats_strategy(
+        &pa,
+        &pb,
+        INTENT,
+        false,
+        fmt,
+        fmt,
+        OptimizationStrategy::Accurate,
+    )
+    .unwrap();
     assert_eq!(baseline.opt_path_label(), "pipeline");
     assert!(!baseline.matshaper_fired());
 
@@ -137,7 +146,16 @@ fn declining_optimizer_falls_back_to_accurate_byte_identical() {
     let pb = Profile::open(&bb).unwrap();
     let fmt = type_rgb_8();
 
-    let baseline = Transform::new_simple_with_formats(&pa, &pb, INTENT, false, fmt, fmt).unwrap();
+    let baseline = Transform::new_simple_with_formats_strategy(
+        &pa,
+        &pb,
+        INTENT,
+        false,
+        fmt,
+        fmt,
+        OptimizationStrategy::Accurate,
+    )
+    .unwrap();
     let mut base_out = vec![0u8; n * 3];
     baseline.do_transform(&grid, &mut base_out, n);
 

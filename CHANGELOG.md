@@ -14,14 +14,16 @@ bytes faster — they never change a result.
 
 ## [0.2.0] - 2026-06-16
 
-Performance release. The default output is unchanged — `Accurate` is still the
-default strategy, so 0.1.0 callers see only additions.
+Performance release. Pixel output is **unchanged and still lossless** — the new
+default strategy `AccurateFast` is byte-for-byte identical to the previous
+`Accurate` default (and to lcms2 `cmsFLAGS_NOOPTIMIZE`), just faster. 0.1.0 callers
+get the speedup for free; nothing about the produced bytes changes.
 
 ### Added
-- `OptimizationStrategy::AccurateFast` — an opt-in **lossless** fast path
-  (byte-identical to `Accurate` and to lcms2 `cmsFLAGS_NOOPTIMIZE`): exact 8-bit
-  input-curve LUTs, a lossless float matrix-shaper (the full-precision analogue of
-  lcms2's lossy `MatShaperEval16`), and a batched/tiled u16 stage-by-stage eval.
+- `OptimizationStrategy::AccurateFast` — **now the default strategy**: a **lossless**
+  fast path (byte-identical to `Accurate` and to lcms2 `cmsFLAGS_NOOPTIMIZE`): exact
+  8-bit input-curve LUTs, a lossless float matrix-shaper (the full-precision analogue
+  of lcms2's lossy `MatShaperEval16`), and a batched/tiled u16 stage-by-stage eval.
   ~1.5–2.4× faster than `Accurate` for bulk buffers, and **faster than lcms2's own
   lossless path**. Falls back to the per-pixel path below 256 px/call, so it is
   never slower than `Accurate` at any chunk size.
@@ -38,9 +40,14 @@ default strategy, so 0.1.0 callers see only additions.
   by both `Accurate` and `AccurateFast` for CMYK-input CLUTs.
 
 ### Changed
-- Performance (default `Accurate` path, all bit-identical): hoisted the per-pixel
-  `Context::new()` out of curve evaluation (was ~13.5% self-time), removed the
-  per-pixel `Vec` allocation from the non-batched eval, and removed a per-tile
+- **Default strategy is now `AccurateFast`** (was `Accurate`). Output is identical —
+  both are lossless and byte-for-byte equal — so this is a pure speedup with no
+  behavior change. `Accurate` remains available explicitly
+  (`OptimizationStrategy::Accurate`) as the minimal single-code-path reference eval
+  for callers that want the cheapest transform *construction*.
+- Performance (the per-pixel `Accurate` path, all bit-identical): hoisted the
+  per-pixel `Context::new()` out of curve evaluation (was ~13.5% self-time), removed
+  the per-pixel `Vec` allocation from the non-batched eval, and removed a per-tile
   `Context` construction from the batched path.
 - README gained a **Performance** section (batching guidance, the consumer-threading
   rationale + example, the `simd` feature, and the x86 build flags).

@@ -12,12 +12,17 @@
 //! link the strategies receive is already pre-optimized. tintbox exposes the
 //! remaining optimizer choice as [`OptimizationStrategy`]:
 //!
-//! - [`Accurate`](OptimizationStrategy::Accurate) (DEFAULT) — full in-place
-//!   pipeline eval, exactly what slice-5 `do_transform` does. Bit-identical to
-//!   lcms2 `-NOOPTIMIZE` (because the link already carries lcms2's unconditional
-//!   `PreOptimize` matrix merge), and MORE accurate than lcms2-DEFAULT. Never
-//!   produces an optimized eval; the structural simplifications lcms2 applies
-//!   unconditionally are baked into the linked pipeline, not the strategy.
+//! - [`AccurateFast`](OptimizationStrategy::AccurateFast) (DEFAULT) — lossless,
+//!   byte-identical speedups over `Accurate` (exact curve LUTs, lossless
+//!   matrix-shaper, batched u16 eval). The default because it is strictly ≥
+//!   `Accurate` per pixel; it trades higher one-time construction cost for
+//!   throughput, so reuse the `Transform`.
+//! - [`Accurate`](OptimizationStrategy::Accurate) — full in-place pipeline eval,
+//!   exactly what slice-5 `do_transform` does. Bit-identical to lcms2 `-NOOPTIMIZE`
+//!   (because the link already carries lcms2's unconditional `PreOptimize` matrix
+//!   merge), and MORE accurate than lcms2-DEFAULT. The minimal single-code-path
+//!   reference eval; the structural simplifications lcms2 applies unconditionally
+//!   are baked into the linked pipeline, not the strategy.
 //! - [`Lcms2Compat`](OptimizationStrategy::Lcms2Compat) (opt-in) — replicate
 //!   lcms2's FULL DEFAULT optimizer chain so the output is byte-identical to
 //!   stock lcms2-default. [`build`](OptimizationStrategy::build) runs lcms2's
@@ -48,27 +53,33 @@ use matshaper::MatShaper8Data;
 use resampling::BakedEval;
 
 /// Which pipeline-optimization posture a [`Transform`](crate::transform::Transform)
-/// uses. Default is [`Accurate`](Self::Accurate).
+/// uses. Default is [`AccurateFast`](Self::AccurateFast) (lossless, byte-identical
+/// to [`Accurate`](Self::Accurate), just faster).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OptimizationStrategy {
-    /// Full in-place pipeline eval (lcms2 `-NOOPTIMIZE`). Most accurate; the
-    /// tintbox default.
-    #[default]
+    /// Full in-place pipeline eval (lcms2 `-NOOPTIMIZE`). Byte-identical to
+    /// [`AccurateFast`](Self::AccurateFast) (the default) but a simpler single code
+    /// path with much cheaper construction (no precomputed LUTs/plan). Opt in
+    /// explicitly for the minimal-construction reference eval — e.g. when building
+    /// many transforms each used for very few pixels.
     Accurate,
     /// Replicate lcms2's full DEFAULT optimizer chain (curve-join, matrix-shaper,
     /// computing-linearization, resampling — the lossy devicelink CLUT bake).
     /// Opt-in; for drop-in byte-identity with stock lcms2-default or as a speed
     /// knob.
     Lcms2Compat,
-    /// LOSSLESS speedups that keep byte-for-byte parity with
-    /// [`Accurate`](Self::Accurate) (and thus lcms2 `-NOOPTIMIZE`), opt-in for
-    /// now. Detects the RGB 8-bit-input matrix-shaper shape and installs the
-    /// [`LosslessMatShaper`](lossless_matshaper::LosslessMatShaper) fast path —
-    /// exact input-curve LUTs + the unchanged f64-accumulated matrix + exact
-    /// output-curve eval — which removes the per-pixel `powf`/parametric input
-    /// eval without changing a single output bit. Any pipeline that does not match
-    /// the shape falls back to the in-place pipeline eval
-    /// ([`Pipeline`](OptimizedEval::Pipeline)).
+    /// **The tintbox default.** LOSSLESS speedups that keep byte-for-byte parity
+    /// with [`Accurate`](Self::Accurate) (and thus lcms2 `-NOOPTIMIZE`): exact
+    /// input-curve LUTs, a lossless matrix-shaper, and a batched/tiled u16 eval.
+    /// ~1.5–2.4× faster for bulk buffers and never slower than `Accurate` at any
+    /// chunk size (it falls back to the per-pixel path below 256 px/call). Anything
+    /// it does not recognize falls back to the in-place pipeline eval
+    /// ([`Pipeline`](OptimizedEval::Pipeline)). Trades a higher one-time
+    /// transform-CONSTRUCTION cost (it precomputes LUTs/plan) for faster per-pixel
+    /// throughput — so cache and reuse the `Transform` (the CMM idiom); prefer
+    /// [`Accurate`](Self::Accurate) if you build many transforms each used for only
+    /// a handful of pixels.
+    #[default]
     AccurateFast,
 }
 
