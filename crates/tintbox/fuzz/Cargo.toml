@@ -1,0 +1,66 @@
+# Deep, coverage-guided fuzzing for tintbox's untrusted-input surfaces.
+#
+# Separate crate, detached from the parent workspace (the empty [workspace]
+# table below) so the stable-pinned workspace is unaffected. Requires nightly:
+#
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run icc_profile
+#   cargo +nightly fuzz run icc_differential
+#   cargo +nightly fuzz run cgats_it8
+#   cargo +nightly fuzz run transform_packed
+#
+# The always-on, stable complement to these targets lives in
+# `crates/tintbox/tests/malformed_icc.rs` and `tests/malformed_cgats.rs`.
+[package]
+name = "tintbox-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent (stable-pinned) workspace.
+[workspace]
+
+# Overflow checks ON in the fuzz build: in release, attacker-controlled size
+# arithmetic wraps silently, so the integer-overflow CVE shapes (CubeSize /
+# ParseCube / IT8 counts) would compute a wrong size rather than be caught. With
+# checks on, that wrap becomes a panic the fuzzer flags as a crash.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "icc_profile"
+path = "fuzz_targets/icc_profile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "icc_differential"
+path = "fuzz_targets/icc_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cgats_it8"
+path = "fuzz_targets/cgats_it8.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transform_packed"
+path = "fuzz_targets/transform_packed.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies]
+arbitrary = { version = "1.4.2", features = ["derive"] }
+libfuzzer-sys = "0.4.13"
+tintbox = { version = "0.2.0", path = ".." }
+tintbox-oracle = { version = "0.0.0", path = "../../tintbox-oracle" }
