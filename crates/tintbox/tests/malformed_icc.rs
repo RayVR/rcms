@@ -36,12 +36,15 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 
+use tintbox::format::decode::{TYPE_CMYK_8, TYPE_GRAY_8, TYPE_RGB_8};
 use tintbox::gamut::detect_tac;
 use tintbox::link::black_point::{detect_black_point, detect_destination_black_point};
 use tintbox::link::{read_devicelink_lut, read_input_lut, read_output_lut};
-use tintbox::profile::{Profile, RenderingIntent};
+use tintbox::profile::virtuals::build_srgb_profile;
+use tintbox::profile::{ColorSpace, Profile, RenderingIntent};
 use tintbox::ps::{get_post_script_crd, get_post_script_csa};
 use tintbox::sig::Signature;
+use tintbox::transform::Transform;
 
 fn testbed_dir() -> PathBuf {
     PathBuf::from(concat!(
@@ -354,6 +357,94 @@ fn valid_profiles_match_lcms2_oracle() {
         assert!(
             (tb_tac - oracle_tac).abs() < 1e-6 || (tb_tac.is_nan() && oracle_tac.is_nan()),
             "{name}: TAC diverges (tintbox={tb_tac}, lcms2={oracle_tac})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Transform *evaluation* robustness (not just parsing).
+// ---------------------------------------------------------------------------
+
+/// Build a transform between the profile and sRGB in both directions and push a
+/// small pixel buffer through, exercising the evaluation pipeline — input/output
+/// curves, matrix, CLUT interpolation, PCS conversion, black-point compensation —
+/// rather than stopping at the parse. Any `Err` is fine; the contract is no
+/// panic / no hang. The deep, coverage-guided version is the `transform_profile`
+/// cargo-fuzz target.
+fn exercise_transform(bytes: &[u8]) {
+    let Ok(profile) = Profile::open(bytes) else {
+        return;
+    };
+    let (dev_fmt, dev_bpp) = match profile.header().color_space {
+        ColorSpace::Gray => (TYPE_GRAY_8, 1usize),
+        ColorSpace::Rgb => (TYPE_RGB_8, 3),
+        ColorSpace::Cmyk => (TYPE_CMYK_8, 4),
+        _ => return,
+    };
+    let srgb = build_srgb_profile();
+    let Ok(rgb) = Profile::from_writable(&srgb) else {
+        return;
+    };
+
+    const N: usize = 32;
+    let intent = RenderingIntent::RelativeColorimetric;
+    // Device -> sRGB (drives the profile's AToB / input curves / matrix / CLUT).
+    if let Ok(x) =
+        Transform::new_simple_with_formats(&profile, &rgb, intent, true, dev_fmt, TYPE_RGB_8)
+    {
+        let src = vec![0x80u8; N * dev_bpp];
+        let mut dst = vec![0u8; N * 3];
+        x.do_transform(&src, &mut dst, N);
+    }
+    // sRGB -> device (drives the profile's BToA / output curves).
+    if let Ok(x) =
+        Transform::new_simple_with_formats(&rgb, &profile, intent, true, TYPE_RGB_8, dev_fmt)
+    {
+        let src = vec![0x80u8; N * 3];
+        let mut dst = vec![0u8; N * dev_bpp];
+        x.do_transform(&src, &mut dst, N);
+    }
+}
+
+#[test]
+fn transform_eval_does_not_panic() {
+    // Valid profiles actually build a transform, so this drives the real eval
+    // pipeline end to end (test1/test2 carry CLUTs); mutations add adversarial
+    // coverage of the build + eval path.
+    for name in [
+        "crayons.icc",
+        "ibm-t61.icc",
+        "new.icc",
+        "test1.icc", // carries CLUTs — drives interpolation in eval
+        "test3.icc",
+        "test5.icc",
+    ] {
+        let bytes = read_testbed(name);
+        assert_no_panic(&format!("transform {name}"), &bytes, exercise_transform);
+    }
+
+    let seeds: Vec<Vec<u8>> = ["crayons.icc", "test3.icc"]
+        .iter()
+        .map(|n| read_testbed(n))
+        .collect();
+    let mut rng = Rng(0xABCD_1234);
+    let iters: usize = std::env::var("TINTBOX_FUZZ_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150);
+    for i in 0..iters {
+        let seed = &seeds[rng.below(seeds.len())];
+        let mut buf = seed.clone();
+        for _ in 0..=rng.below(4) {
+            let idx = rng.below(buf.len().max(1));
+            if idx < buf.len() {
+                buf[idx] ^= (rng.next_u64() & 0xFF) as u8;
+            }
+        }
+        assert_no_panic(
+            &format!("transform mutation iter={i}"),
+            &buf,
+            exercise_transform,
         );
     }
 }

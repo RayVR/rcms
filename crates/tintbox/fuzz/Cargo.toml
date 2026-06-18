@@ -59,6 +59,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "transform_profile"
+path = "fuzz_targets/transform_profile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "curve_eval"
+path = "fuzz_targets/curve_eval.rs"
+test = false
+doc = false
+bench = false
+
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 libfuzzer-sys = "0.4.13"
