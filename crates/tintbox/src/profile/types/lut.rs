@@ -571,3 +571,49 @@ pub fn read_lut_b2a<R: ProfileReader>(r: &mut R, _size: u32) -> Result<Tag> {
 
     Ok(Tag::Lut(lut))
 }
+
+/// Bounded-model-checking proofs (run with `cargo kani`) that the CLUT
+/// size-arithmetic — the home of lcms2's integer-overflow CVE class
+/// (CVE-2026-41254 `CubeSize`, the IT8/CUBE count-multiplication bugs) — is a
+/// total function for every input: it never panics, never overflows, and
+/// upholds the headroom bound the granular-CLUT readers depend on. Where
+/// fuzzing samples inputs, these *prove* the property over the whole input
+/// space. Compiled only under `cfg(kani)`, so normal builds and `cargo test`
+/// never see them and no dependency is added.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{cube_size, granular_clut_entries};
+
+    /// When `cube_size` returns a nonzero count, that count is `<= u32::MAX / 15`.
+    /// This is the invariant `granular_clut_entries` relies on: a subsequent
+    /// `output_channels * cube` with `output_channels <= 15` then cannot overflow
+    /// `u32`. Kani also verifies the `u64` accumulation itself never overflows and
+    /// the `as u32` cast never truncates.
+    #[kani::proof]
+    fn cube_size_result_leaves_headroom() {
+        let dims: [u32; 4] = kani::any();
+        let r = cube_size(&dims);
+        if r != 0 {
+            assert!(r <= u32::MAX / 15);
+        }
+    }
+
+    /// `granular_clut_entries` is total (no panic/overflow) for any grid and any
+    /// output-channel count in the validated `1..=15` range.
+    #[kani::proof]
+    fn granular_clut_entries_total() {
+        let output_channels: u32 = kani::any();
+        kani::assume(output_channels <= 15);
+        let grid: [u32; 4] = kani::any();
+        let _ = granular_clut_entries(output_channels, &grid);
+    }
+
+    // `uipow` deliberately has no Kani harness. It is already total by
+    // construction — every step is `checked_mul`, which returns `None` on
+    // overflow rather than panicking — so there is nothing the type system does
+    // not already guarantee. It is also intractable for the SAT backend: the loop
+    // is a chain of up to `b` symbolic 32-bit multiplications, and bit-blasted
+    // nonlinear symbolic multiply chains blow up CBMC. The function that *does*
+    // need proving is `cube_size`, whose manual `u64` guards (not `checked_mul`)
+    // are where an overflow bug could actually hide — and that proof is above.
+}

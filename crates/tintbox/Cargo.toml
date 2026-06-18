@@ -15,6 +15,12 @@ categories = ["graphics", "multimedia::images"]
 # on disk for local `cargo test`/`bench`/`run --example`; only packaging skips them.)
 exclude = ["tests/**", "benches/**", "examples/**"]
 
+# `cfg(kani)` gates the bounded-model-checking proofs (src/profile/types/lut.rs),
+# compiled only under `cargo kani`. Declare it so the check-cfg lint doesn't flag
+# it as unknown in normal builds.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [features]
 default = ["std"]
 std = []
