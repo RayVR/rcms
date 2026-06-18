@@ -74,7 +74,7 @@ fn xyy_to_xyz(s: CIExyY) -> CIEXYZ {
 /// nondeterministic placeholder fields (CMM/creator/platform/date) pinned to the
 /// same fixed values the oracle uses, the rest as the constructor sets them. The
 /// caller overrides `version`/`device_class`/`color_space`/`pcs`/`rendering_intent`.
-fn virtual_header() -> Header {
+pub(crate) fn virtual_header() -> Header {
     Header {
         size: 0, // patched by the serializer.
         cmm: Signature::from_raw(0),

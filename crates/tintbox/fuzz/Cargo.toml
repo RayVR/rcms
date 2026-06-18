@@ -73,6 +73,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "cube_file"
+path = "fuzz_targets/cube_file.rs"
+test = false
+doc = false
+bench = false
+
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 libfuzzer-sys = "0.4.13"

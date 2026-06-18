@@ -48,6 +48,17 @@ enum Symbol {
     Keyword,
     DataFormatId,
     Include,
+    // `.cube` (Iridas/Adobe 3D-LUT) keywords. lcms2 shares this lexer for CUBE
+    // files via an `IsCUBE` flag (cmscgats.c), swapping the keyword table.
+    CubeTitle,
+    CubeDomainMin,
+    CubeDomainMax,
+    CubeLut1dSize,
+    CubeLut3dSize,
+    CubeLut1dInputRange,
+    CubeLut3dInputRange,
+    CubeLutInVideoRange,
+    CubeLutOutVideoRange,
 }
 
 /// How a property value is written out.
@@ -333,6 +344,10 @@ struct Parser<'a> {
     string: String,
 
     lineno: i32,
+
+    /// When set, the lexer resolves identifiers against the `.cube` keyword
+    /// table instead of the IT8 one (lcms2 `IsCUBE`).
+    is_cube: bool,
 }
 
 impl Profile {
@@ -628,6 +643,7 @@ impl<'a> Parser<'a> {
             id: String::new(),
             string: String::new(),
             lineno: 1,
+            is_cube: false,
         }
     }
 
@@ -731,7 +747,12 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
-                match bin_srch_key(&self.id) {
+                let key = if self.is_cube {
+                    bin_srch_key_cube(&self.id)
+                } else {
+                    bin_srch_key(&self.id)
+                };
+                match key {
                     Some(sym) => self.sy = sym,
                     None => self.sy = Symbol::Ident,
                 }
@@ -937,6 +958,30 @@ impl<'a> Parser<'a> {
 
 fn bin_srch_key(id: &str) -> Option<Symbol> {
     for (k, sym) in TAB_KEYS_IT8 {
+        if strcasecmp_eq(id, k) {
+            return Some(*sym);
+        }
+    }
+    None
+}
+
+/// The `.cube` keyword table (lcms2 `TabKeysCUBE`, cmscgats.c:243). Selected by
+/// the lexer when [`Parser::is_cube`] is set, exactly as lcms2 swaps tables on
+/// its `IsCUBE` flag.
+const TAB_KEYS_CUBE: &[(&str, Symbol)] = &[
+    ("DOMAIN_MAX", Symbol::CubeDomainMax),
+    ("DOMAIN_MIN", Symbol::CubeDomainMin),
+    ("LUT_1D_SIZE", Symbol::CubeLut1dSize),
+    ("LUT_1D_INPUT_RANGE", Symbol::CubeLut1dInputRange),
+    ("LUT_3D_SIZE", Symbol::CubeLut3dSize),
+    ("LUT_3D_INPUT_RANGE", Symbol::CubeLut3dInputRange),
+    ("LUT_IN_VIDEO_RANGE", Symbol::CubeLutInVideoRange),
+    ("LUT_OUT_VIDEO_RANGE", Symbol::CubeLutOutVideoRange),
+    ("TITLE", Symbol::CubeTitle),
+];
+
+fn bin_srch_key_cube(id: &str) -> Option<Symbol> {
+    for (k, sym) in TAB_KEYS_CUBE {
         if strcasecmp_eq(id, k) {
             return Some(*sym);
         }
@@ -1816,5 +1861,287 @@ impl Profile {
             }
         }
         out.extend_from_slice(b"END_DATA\n");
+    }
+}
+
+// ===================================================================== .cube
+// Port of lcms2's `.cube` (Iridas/Adobe 3D-LUT) reader + RGB device-link
+// builder (`ParseCube` / `cmsCreateDeviceLinkFromCubeFileTHR`, cmscgats.c). The
+// shared lexer above handles tokenisation (driven by `Parser::is_cube`).
+
+use crate::curve::{build_gamma, build_tabulated_float, ToneCurve};
+use crate::interp::InterpParams;
+use crate::pipeline::clut::{Clut, ClutTable, ResolvedInterp};
+use crate::pipeline::{Pipeline, Stage};
+use crate::profile::header::{ColorSpace, Header, ProfileClass, RenderingIntent};
+use crate::profile::serialize::WritableProfile;
+use crate::profile::tag::{Mlu, Tag};
+use crate::profile::virtuals::virtual_header;
+use crate::sig::Signature;
+
+/// The parsed contents of a `.cube` file: an optional 1D shaper (3 tone curves),
+/// an optional 3D CLUT (`(grid_size, flat f32 table)`, stored B/G/R per node as
+/// lcms2 does), and the `TITLE`.
+struct CubeData {
+    title: String,
+    shaper: Option<Vec<ToneCurve>>,
+    clut: Option<(u32, Vec<f32>)>,
+}
+
+impl Parser<'_> {
+    /// `ReadNumbers` (cmscgats.c:3066): read `arr.len()` numbers (int or real),
+    /// advancing past each, then consume the end-of-line. Returns false on a
+    /// non-number token (lcms2 `SynError`).
+    fn read_numbers(&mut self, arr: &mut [f64]) -> bool {
+        for slot in arr.iter_mut() {
+            match self.sy {
+                Symbol::Inum => *slot = self.inum as f64,
+                Symbol::Dnum => *slot = self.dnum,
+                _ => {
+                    self.syn_error();
+                    return false;
+                }
+            }
+            self.in_symbol();
+        }
+        self.check_eoln()
+    }
+
+    /// Port of lcms2 `ParseCube` (cmscgats.c:3087). All indices below are bounded
+    /// by the freshly-allocated table lengths (`i < n`/`i < nodes`, `c < 3`), so
+    /// the indexing is panic-free.
+    #[allow(clippy::indexing_slicing)]
+    fn parse_cube(&mut self) -> Result<CubeData> {
+        let mut domain_min = [0.0f64; 3];
+        let mut domain_max = [1.0f64, 1.0, 1.0];
+        let mut check_0_1 = [0.0f64, 1.0];
+        let mut shaper_size = 0i32;
+        let mut lut_size = 0i32;
+        let mut title = String::new();
+        let mut shaper = None;
+        let mut clut = None;
+
+        self.in_symbol();
+        while self.sy != Symbol::Eof && self.sy != Symbol::SynError {
+            match self.sy {
+                Symbol::CubeTitle => {
+                    self.in_symbol();
+                    if !self.check(Symbol::Str) {
+                        return Err(Error::Corrupt("cube: title string expected"));
+                    }
+                    title = self.string.clone();
+                    self.in_symbol();
+                }
+                Symbol::CubeDomainMin => {
+                    self.in_symbol();
+                    if !self.read_numbers(&mut domain_min) {
+                        return Err(Error::Corrupt("cube: DOMAIN_MIN"));
+                    }
+                }
+                Symbol::CubeDomainMax => {
+                    self.in_symbol();
+                    if !self.read_numbers(&mut domain_max) {
+                        return Err(Error::Corrupt("cube: DOMAIN_MAX"));
+                    }
+                }
+                Symbol::CubeLut1dSize => {
+                    self.in_symbol();
+                    if !self.check(Symbol::Inum) {
+                        return Err(Error::Corrupt("cube: shaper size expected"));
+                    }
+                    shaper_size = self.inum;
+                    if !(2..=65536).contains(&shaper_size) {
+                        return Err(Error::Corrupt("cube: LUT_1D_SIZE out of bounds"));
+                    }
+                    self.in_symbol();
+                }
+                Symbol::CubeLut3dSize => {
+                    self.in_symbol();
+                    if !self.check(Symbol::Inum) {
+                        return Err(Error::Corrupt("cube: LUT size expected"));
+                    }
+                    lut_size = self.inum;
+                    self.in_symbol();
+                }
+                Symbol::CubeLut1dInputRange | Symbol::CubeLut3dInputRange => {
+                    self.in_symbol();
+                    if !self.read_numbers(&mut check_0_1) {
+                        return Err(Error::Corrupt("cube: input range"));
+                    }
+                    if check_0_1[0] != 0.0 || check_0_1[1] != 1.0 {
+                        return Err(Error::Corrupt("cube: unsupported input range"));
+                    }
+                }
+                Symbol::Eoln => self.in_symbol(),
+                // Start of the numeric data block (shaper rows then CLUT nodes).
+                Symbol::Inum | Symbol::Dnum => {
+                    if shaper_size > 0 {
+                        let n = shaper_size as usize;
+                        let mut shapers = vec![0.0f32; 3 * n];
+                        for i in 0..n {
+                            let mut nums = [0.0f64; 3];
+                            if !self.read_numbers(&mut nums) {
+                                return Err(Error::Corrupt("cube: shaper row"));
+                            }
+                            for c in 0..3 {
+                                let span = domain_max[c] - domain_min[c];
+                                shapers[i + c * n] = ((nums[c] - domain_min[c]) / span) as f32;
+                            }
+                        }
+                        let mut curves = Vec::with_capacity(3);
+                        for c in 0..3 {
+                            let curve = build_tabulated_float(&shapers[c * n..c * n + n])
+                                .ok_or(Error::Corrupt("cube: shaper curve"))?;
+                            curves.push(curve);
+                        }
+                        shaper = Some(curves);
+                    }
+
+                    if lut_size > 0 {
+                        // lcms2 2.19.1 caps the grid (the CVE-2026-42798 fix); this
+                        // bound is therefore both byte-identical and panic/OOM-safe
+                        // (65^3 * 3 floats fits comfortably).
+                        if !(2..=65).contains(&lut_size) {
+                            return Err(Error::Corrupt("cube: LUT size not allowed"));
+                        }
+                        let nodes = cube_nodes(lut_size);
+                        let mut table = vec![0.0f32; nodes * 3];
+                        for i in 0..nodes {
+                            let mut nums = [0.0f64; 3];
+                            if !self.read_numbers(&mut nums) {
+                                return Err(Error::Corrupt("cube: CLUT node"));
+                            }
+                            // lcms2 stores the node R<->B swapped (BGR order).
+                            for c in 0..3 {
+                                let span = domain_max[c] - domain_min[c];
+                                let v = ((nums[c] - domain_min[c]) / span) as f32;
+                                table[i * 3 + (2 - c)] = v;
+                            }
+                        }
+                        clut = Some((lut_size as u32, table));
+                    }
+
+                    if !self.check(Symbol::Eof) {
+                        return Err(Error::Corrupt("cube: extra symbols after data"));
+                    }
+                }
+                _ => {
+                    self.syn_error();
+                    return Err(Error::Corrupt("cube: unsupported keyword"));
+                }
+            }
+            self.skip_eoln();
+        }
+
+        Ok(CubeData {
+            title,
+            shaper,
+            clut,
+        })
+    }
+}
+
+/// Port of lcms2 `cmsCreateDeviceLinkFromCubeFileTHR` (cmscgats.c:3231): parse a
+/// `.cube` 3D-LUT from memory and build the RGB->RGB device-link profile lcms2
+/// produces from it — v4.4, Link class, RGB PCS, perceptual intent, with the
+/// shaper + float CLUT in the `A2B0` tag and the `TITLE` as the description.
+/// Returns a [`WritableProfile`]; serialise it with `save_to_mem` for the bytes.
+///
+/// lcms2's API is file-based (`cmsCreateDeviceLinkFromCubeFile`); this takes
+/// bytes instead, keeping the crate's abstract, wasm-clean I/O — the produced
+/// profile bytes are the parity target, not the API signature.
+pub fn create_devicelink_from_cube_mem(buf: &[u8]) -> Result<WritableProfile> {
+    let mut parser = Parser::new(buf);
+    parser.is_cube = true;
+    let cube = parser.parse_cube()?;
+
+    // lcms2 builds `[Shaper?, CLUT]` and — for any cube with a 3D LUT — then
+    // CANNOT serialise it: that pipeline matches none of the stage shapes lcms2's
+    // own `mAB` writer accepts (all require trailing B-curves it never appends),
+    // so `cmsSaveProfileToMem` fails. We emit the equivalent, serialisable shape:
+    //
+    //   - CLUT present  -> `[A, CLUT, B]` with A = shaper-or-identity and an
+    //     identity B. Identity curves are exact no-ops, so this evaluates
+    //     bit-identically to lcms2's in-memory `[Shaper?, CLUT]` transform, while
+    //     also being savable (the fix lcms2 lacks).
+    //   - shaper only   -> `[B = shaper]`, which is exactly what lcms2 writes for
+    //     the one case it can save, so that stays byte-identical to lcms2.
+    let CubeData {
+        title,
+        shaper,
+        clut,
+    } = cube;
+    let mut pipeline = Pipeline::new(3, 3);
+    match clut {
+        Some((lut_size, table)) => {
+            let a = shaper.unwrap_or_else(identity_curves);
+            pipeline.insert_stage_at_end(Stage::ToneCurves(a))?;
+            let grid = vec![lut_size; 3];
+            pipeline.insert_stage_at_end(Stage::Clut(Clut {
+                table: ClutTable::F32(table),
+                params: InterpParams::new(&grid, 3, 3),
+                is_trilinear: false,
+                implements_identity: false,
+                resolved: ResolvedInterp::default(),
+            }))?;
+            pipeline.insert_stage_at_end(Stage::ToneCurves(identity_curves()))?;
+        }
+        None => {
+            if let Some(shaper) = shaper {
+                pipeline.insert_stage_at_end(Stage::ToneCurves(shaper))?;
+            }
+        }
+    }
+
+    let mut profile = WritableProfile::new(Header {
+        version: 0x0440_0000,
+        device_class: ProfileClass::Link,
+        color_space: ColorSpace::Rgb,
+        pcs: ColorSpace::Rgb,
+        rendering_intent: RenderingIntent::Perceptual,
+        ..virtual_header()
+    });
+    // Description from TITLE, no copyright (lcms2: "nothing on the copyrighted
+    // state of the .cube"). cmsNoLanguage / cmsNoCountry == [0, 0].
+    profile.add_tag(
+        Signature::from_bytes(*b"desc"),
+        Tag::Mlu(Mlu::from_wide([0, 0], [0, 0], &title)),
+    );
+    profile.add_tag(Signature::from_bytes(*b"A2B0"), Tag::Lut(pipeline));
+    Ok(profile)
+}
+
+/// Three identity (gamma 1.0) tone curves — exact no-ops, used for the A/B-curve
+/// slots an `mAB` device-link requires but a `.cube` does not provide.
+fn identity_curves() -> Vec<ToneCurve> {
+    vec![build_gamma(1.0), build_gamma(1.0), build_gamma(1.0)]
+}
+
+/// `lut_size^3` — the node count of a `.cube` 3D LUT. The caller validates
+/// `lut_size` to `2..=65` (lcms2 2.19.1's grid cap, the CVE-2026-42798 fix);
+/// within that range the `i32` product cannot overflow and `nodes * 3` (the RGB
+/// table length) stays far inside `usize`. Proven over the whole range by the
+/// kani harness below.
+fn cube_nodes(lut_size: i32) -> usize {
+    (lut_size * lut_size * lut_size) as usize
+}
+
+/// Bounded-model-checking proof (run with `cargo kani`) that the `.cube`
+/// table-size arithmetic — the integer-overflow surface lcms2's `ParseCube`
+/// hardened in 2.19.1 (CVE-2026-42798) — cannot overflow for any grid size in
+/// the validated range. Compiled only under `cfg(kani)`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::cube_nodes;
+
+    #[kani::proof]
+    fn cube_table_len_no_overflow() {
+        let lut_size: i32 = kani::any();
+        kani::assume((2..=65).contains(&lut_size));
+        // Kani checks the `i32` product in `cube_nodes` and this `usize` product
+        // for overflow; the assertion pins the resulting bound.
+        let nodes = cube_nodes(lut_size);
+        let table_len = nodes * 3;
+        assert!(table_len <= 65 * 65 * 65 * 3);
     }
 }
