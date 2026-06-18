@@ -47,7 +47,7 @@ tested against lcms2:
 | Pipelines | `Stage` pipeline, n-D interpolation (tetrahedral/trilinear/…), LUT/MPE tags |
 | Transforms | `cmsCreateTransform`/`cmsDoTransform`, all 4 rendering intents, absolute-colorimetric + black-point compensation, black-point detection |
 | Pixel formats | Packed `TYPE_*` 8/16/float/double, RGB/CMYK/Gray/Lab/XYZ, swap/flavor/endian, alpha copy |
-| Optimization | Swappable strategy: `Accurate` (lossless, default) or `Lcms2Compat` (matches stock lcms2-default incl. the CLUT-baking optimizer) |
+| Optimization | Swappable strategy: `AccurateFast` (lossless, default — faster than `Accurate`, byte-identical to it), `Accurate` (the minimal single-code-path reference eval), or `Lcms2Compat` (matches stock lcms2-default incl. the CLUT-baking optimizer) |
 | Virtual profiles | sRGB, RGB, gray, Lab2/Lab4, XYZ, NULL, linearization device-link — byte-identical to `cmsCreate*Profile` |
 | Peripheral | CGATS/IT8.7, CIECAM02, PostScript CSA/CRD, named/spot colors, gamut boundary + `cmsDetectTAC` + proofing/gamut-check |
 | Extensibility | lcms2's plugin categories as idiomatic Rust traits (parametric curves, tag types, rendering intents, optimizers, interpolators) |
@@ -74,8 +74,11 @@ let mut dst = vec![0u8; n_pixels * 4];
 xform.do_transform(&pixels, &mut dst, n_pixels);
 ```
 
-The default optimization strategy is `Accurate` (full-precision, lossless, and
-bit-identical to lcms2 run with `cmsFLAGS_NOOPTIMIZE`). Opt into
+The default optimization strategy is `AccurateFast` — full-precision and lossless
+(byte-identical to `Accurate`, and thus to lcms2 run with `cmsFLAGS_NOOPTIMIZE`),
+with lossless speedups for bulk buffers. Opt into `OptimizationStrategy::Accurate`
+for the minimal single-code-path reference eval (cheaper construction; prefer it
+when building many transforms each used for only a handful of pixels), or
 `OptimizationStrategy::Lcms2Compat` for drop-in parity with stock lcms2-default.
 
 ## Extending tintbox (plugins)
@@ -159,8 +162,10 @@ keeps using the verified default.
 Everything below is **lossless and byte-identical to lcms2** — these are ways to
 compute the same numbers faster, never to compute different (lossy) ones.
 
-The default `Accurate` strategy evaluates the full pipeline per pixel and is the
-fastest *correct* path here — faster than lcms2 run with `cmsFLAGS_NOOPTIMIZE`.
+The default `AccurateFast` strategy adds lossless speedups (exact input-curve
+LUTs, a lossless matrix-shaper, and a batched/tiled u16 eval) on top of the
+full-pipeline `Accurate` eval, making it the fastest *correct* path here — faster
+than lcms2 run with `cmsFLAGS_NOOPTIMIZE`, while staying byte-identical to it.
 The only thing faster is lcms2's **default** optimizer, which bakes the pipeline
 into one coarse CLUT (a single lookup per pixel) at the cost of posterizing
 shadow detail; if you knowingly want that trade, `OptimizationStrategy::Lcms2Compat`
