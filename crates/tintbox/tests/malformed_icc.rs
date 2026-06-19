@@ -448,3 +448,57 @@ fn transform_eval_does_not_panic() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. Targeted mutation of LUT channel/dimension COUNT fields.
+// ---------------------------------------------------------------------------
+
+/// Byte offset of a tag's data block from the profile's tag directory.
+fn find_tag_offset(profile: &[u8], sig: &[u8; 4]) -> Option<usize> {
+    let count = u32::from_be_bytes(profile.get(128..132)?.try_into().ok()?) as usize;
+    for i in 0..count {
+        let e = 132 + i * 12;
+        if profile.get(e..e + 4)? == sig {
+            return Some(u32::from_be_bytes(profile.get(e + 4..e + 8)?.try_into().ok()?) as usize);
+        }
+    }
+    None
+}
+
+/// Robustness over the mft1/mft2 channel/dimension *count* fields — the byte
+/// class the 16-input-channel CLUT bug lived in, and one the generic mutation
+/// fuzz above rarely lands on. Drive boundary values (including the culprit 16)
+/// through those bytes of a real mft1 (test3) and mft2 (test1) `A2B0` tag and run
+/// the read + transform: it must always reject cleanly, never panic. (The eval
+/// panic that bug *would* have caused isn't reachable via a transform — pixel
+/// formats cap channels at 15 — so the targeted teeth for it are the dedicated
+/// `mft1_with_16_input_channels_is_rejected_not_paniced` (parse reject) and
+/// `pipeline_rejects_over_wide_clut` (eval backstop) tests.)
+#[test]
+fn lut_count_field_mutations_do_not_panic() {
+    // After the 8-byte type base, the mft body begins: in_chan, out_chan,
+    // clut_points/precision, pad.
+    let values: [u8; 11] = [0, 1, 2, 3, 4, 5, 15, 16, 17, 18, 255];
+    for name in ["test1.icc", "test3.icc"] {
+        let base = read_testbed(name);
+        let off = find_tag_offset(&base, b"A2B0").expect("testbed profile has an A2B0 tag");
+        for byte in 0..4usize {
+            for &val in &values {
+                let mut buf = base.clone();
+                if off + 8 + byte < buf.len() {
+                    buf[off + 8 + byte] = val;
+                }
+                // Both the read (LUT build) AND the transform eval — the original
+                // 16-input panic fired at transform-build/eval, not at the read.
+                assert_no_panic(
+                    &format!("{name} A2B0 count byte +{byte} = {val}"),
+                    &buf,
+                    |b| {
+                        exercise_fast(b);
+                        exercise_transform(b);
+                    },
+                );
+            }
+        }
+    }
+}

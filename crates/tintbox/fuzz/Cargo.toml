@@ -85,3 +85,10 @@ arbitrary = { version = "1.4.2", features = ["derive"] }
 libfuzzer-sys = "0.4.13"
 tintbox = { version = "0.2.0", path = ".." }
 tintbox-oracle = { version = "0.0.0", path = "../../tintbox-oracle" }
+
+[[bin]]
+name = "lut_counts"
+path = "fuzz_targets/lut_counts.rs"
+test = false
+doc = false
+bench = false
